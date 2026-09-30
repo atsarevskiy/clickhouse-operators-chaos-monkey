@@ -99,6 +99,21 @@ class OperatorAdapter(abc.ABC):
         """A Service name that load-balances client queries across the ClickHouse hosts."""
 
     @abc.abstractmethod
+    def server_replica_label(self, spec: ClusterSpec, replica: int) -> str:
+        """A single label=value selecting every server pod of one replica index."""
+
+    def ready_endpoint_ips(self, spec: ClusterSpec) -> set[str]:
+        """Pod IPs currently published as ready by the client Service."""
+        ips: set[str] = set()
+        svc = self.query_service(spec)
+        for slice_ in self.kube.items("endpointslices", spec.namespace,
+                                      f"kubernetes.io/service-name={svc}"):
+            for ep in slice_.get("endpoints", []) or []:
+                if (ep.get("conditions") or {}).get("ready") is not False:
+                    ips.update(ep.get("addresses") or [])
+        return ips
+
+    @abc.abstractmethod
     def keeper_hosts(self, spec: ClusterSpec) -> list[str]:
         """Per-member DNS names that answer the Keeper client port, for the quorum probe."""
 

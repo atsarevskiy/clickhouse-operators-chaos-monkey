@@ -78,8 +78,33 @@ def scorecard(results: list[dict]) -> str:
         row = [s]
         for o, v in targets:
             r = index.get((o, v, s))
-            row.append(r["verdict"] if r else "-")
+            if not r:
+                row.append("-")
+                continue
+            took = _m(r, "time_to_recover_s")
+            row.append(f"{r['verdict']} ({took} s)" if took != "-" else r["verdict"])
         lines.append("| " + " | ".join(row) + " |")
+    lines += ["", "Time in brackets: seconds from the failure (or from when a held fault was cleared) "
+                  "until every pod was Ready and the scenario's change had reached every pod.", ""]
+
+    lines += ["## Speed", "",
+              "Seconds; lower is better. `recover` = every pod Ready, `status` = the operator also "
+              "reports the cluster healthy, `create` = fresh cluster to healthy baseline.", "",
+              "| Scenario | " + " | ".join(f"{o} {v} recover / status / create" for o, v in targets) + " |",
+              "|---|" + "---|" * len(targets)]
+    for s in scenarios:
+        row = [s]
+        for o, v in targets:
+            r = index.get((o, v, s))
+            row.append(" / ".join(_m(r, k) for k in ("time_to_recover_s", "time_to_status_healthy_s", "baseline_create_s"))
+                       if r else "-")
+        lines.append("| " + " | ".join(row) + " |")
+    medians = []
+    for o, v in targets:
+        vals = sorted(m["value"] for r in results if (r["operator"], r["version"]) == (o, v)
+                      for m in r["measurements"] if m["name"] == "time_to_recover_s" and m["value"] is not None)
+        medians.append(f"{vals[len(vals) // 2]:g}" if vals else "-")
+    lines.append("| **median recover (recovered scenarios only)** | " + " | ".join(medians) + " |")
     lines.append("")
 
     perf = [r for r in results if r["category"] == "performance"]

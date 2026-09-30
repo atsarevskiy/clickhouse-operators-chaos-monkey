@@ -208,6 +208,9 @@ class ClickHouseOperator(OperatorAdapter):
             sel += f",{GROUP}/replica-id={replica}"
         return sel
 
+    def server_replica_label(self, spec: ClusterSpec, replica: int) -> str:
+        return f"{GROUP}/replica-id={replica}"
+
     def keeper_selector(self, spec: ClusterSpec) -> str:
         return f"app={spec.name}-keeper"
 

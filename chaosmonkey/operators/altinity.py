@@ -203,6 +203,9 @@ class AltinityOperator(OperatorAdapter):
             sel += f",{CHI_GROUP}/replica={replica}"
         return sel
 
+    def server_replica_label(self, spec: ClusterSpec, replica: int) -> str:
+        return f"{CHI_GROUP}/replica={replica}"
+
     def keeper_selector(self, spec: ClusterSpec) -> str:
         return f"{CHK_GROUP}/chk={self._keeper_name(spec)}"
 

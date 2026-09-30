@@ -7,6 +7,9 @@ from .changes import (ImmutableFieldChange, InvalidSpecRejected, KeeperPartition
                       PerfOperatorRestart, PerfRollingRestart, PerfScaleOut, ReplicaIsolation, RollingConfigChange,
                       ScaleDownReplica, ScaleUpReplica, ScaleUpShard, UnschedulableReplacement, VersionUpgrade,
                       WedgedShutdownRecreate)
+from .tracker import (DeletionWithoutOperator, ForegroundDeletion, KeeperRollingRestart,
+                      KeeperStatefulSetDeleted, MigrationFailureMarkedDone, ReplicaServesBeforeSchema,
+                      RestartDuringSlowStart, ScaleDownLeavesReplicaMetadata, ScaleDownShardLeavesMetadata)
 from .failures import (AllServersKill, BadConfigRollout, ConfigMapsDeletedThenRestart, KeeperAllKill,
                        KeeperMemberKill, KeeperQuorumLoss, OperatorDownDuringFailure, OperatorKillIdle,
                        OperatorKillMidDriftRepair, OperatorKillMidRollout, PvcDeleted, ServerPodKill,
@@ -22,6 +25,10 @@ ALL: list[Scenario] = [
     WedgedShutdownRecreate(),
     NodeDrain(), NodeStop(), KeeperPartition(), ReplicaIsolation(),
     PerfRollingRestart(), PerfScaleOut(), PerfOperatorRestart(),
+    # from the operators' own issue trackers
+    ScaleDownLeavesReplicaMetadata(), ScaleDownShardLeavesMetadata(), ReplicaServesBeforeSchema(),
+    MigrationFailureMarkedDone(), KeeperStatefulSetDeleted(), ForegroundDeletion(),
+    DeletionWithoutOperator(), KeeperRollingRestart(), RestartDuringSlowStart(),
 ]
 BY_ID = {s.id: s for s in ALL}
 
@@ -38,12 +45,19 @@ _FULL = _STANDARD + [
     "scale-down-replica", "server-version-upgrade", "recreate-on-immutable-change",
     "unschedulable-replacement", "wedged-shutdown-recreate", "node-drain", "node-stop",
 ]
+_TRACKER = [
+    "keeper-statefulset-deleted", "cluster-deleted-foreground", "cluster-deleted-while-operator-down",
+    "new-replica-published-before-schema", "scale-down-replica-metadata", "keeper-rolling-restart",
+    "new-replica-schema-blocked", "config-change-during-slow-start", "scale-down-shard-then-up",
+]
+_FULL += _TRACKER
 _PERF = ["perf-rolling-restart", "perf-scale-out", "perf-operator-restart"]
 
 PROFILES: dict[str, list[str]] = {
     "smoke": _SMOKE,
     "standard": _STANDARD,
     "full": _FULL,
+    "tracker": _TRACKER,
     "perf": _PERF,
     "all": _FULL + _PERF,
 }

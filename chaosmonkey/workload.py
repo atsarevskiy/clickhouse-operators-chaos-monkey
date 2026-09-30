@@ -38,6 +38,27 @@ class Workload:
                 return pod["metadata"]["name"]
         return None
 
+    def table_count(self, pod: str) -> int | None:
+        rc, out = self.op.sql(self.spec, pod, f"SELECT count() FROM system.tables WHERE database = '{DB}'")
+        return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
+
+    def total_replicas(self, pod: str) -> int | None:
+        rc, out = self.op.sql(self.spec, pod, "SELECT max(total_replicas) FROM system.replicas "
+                                             f"WHERE database = '{DB}' AND table = 'events'")
+        return int(out.strip()) if rc == 0 and out.strip().isdigit() else None
+
+    def zk_children(self, pod: str, path: str) -> list[str] | None:
+        """Children of a Keeper path as ClickHouse sees them, or None if the query failed."""
+        rc, out = self.op.sql(self.spec, pod, f"SELECT name FROM system.zookeeper WHERE path = '{path}'")
+        if rc != 0:
+            return None
+        return [x for x in out.strip().splitlines() if x]
+
+    def table_zk_path(self, pod: str) -> str | None:
+        rc, out = self.op.sql(self.spec, pod, "SELECT zookeeper_path FROM system.replicas "
+                                             f"WHERE database = '{DB}' AND table = 'events' LIMIT 1")
+        return out.strip() or None if rc == 0 else None
+
     def setup(self) -> list[Finding]:
         findings = []
         ddl = [
@@ -166,6 +187,16 @@ class Workload:
         write_pct, write_gap = stats("write")
         return {"samples": len(rows), "read_pct": read_pct, "read_longest_outage_s": read_gap,
                 "write_pct": write_pct, "write_longest_outage_s": write_gap}
+
+    def keeper_leaderless(self, since: float, until: float | None = None) -> dict:
+        """Longest run of consecutive samples in which no member reported itself leader."""
+        rows = [r for r in self._probe_lines("keeper-probe", since) if until is None or int(r[0]) <= until]
+        longest = run = 0
+        for r in rows:
+            modes = " ".join(r[1:]).split("modes=")[-1].split()
+            run = 0 if "leader" in modes else run + 1
+            longest = max(longest, run)
+        return {"samples": len(rows), "longest_leaderless_s": longest}
 
     def keeper_quorum(self, since: float, until: float | None = None) -> dict:
         quorum = self.spec.keepers // 2 + 1

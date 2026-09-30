@@ -37,6 +37,9 @@ class Expectations:
     keeper_quorum_must_hold: bool = True
     data_must_survive: bool = True       # FAIL on any lost row
     status_must_converge: bool = True    # status reports healthy once everything is healthy
+    # False for scenarios that end with the cluster deliberately gone: there is nothing left to
+    # write to or count, so the data and post-recovery write checks do not apply.
+    cluster_survives: bool = True
 
 
 @dataclass

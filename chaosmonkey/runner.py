@@ -113,7 +113,9 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         exp = scenario.expect
 
         # recovery
-        if ctx.recovered_at is None:
+        if not exp.cluster_survives:
+            pass
+        elif ctx.recovered_at is None:
             result.add("fail", "recovery", f"cluster not healthy {int(t_end - ctx.t_inject)}s after the failure "
                                            f"({op.ready_servers(spec)}/{spec.hosts} servers, "
                                            f"{op.ready_keepers(spec)}/{spec.keepers} keepers Ready)")
@@ -121,7 +123,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
             result.measure("time_to_recover_s", ctx.recovered_at, "s")
             if ctx.recovered_at > exp.recover_slo_s:
                 result.add("warn", "recovery time", f"{ctx.recovered_at:.0f}s, target {exp.recover_slo_s}s")
-        if exp.status_must_converge and ctx.recovered_at is not None:
+        if exp.status_must_converge and exp.cluster_survives and ctx.recovered_at is not None:
             if ctx.status_converged_at is None:
                 result.add("warn", "status truthfulness",
                            f"every pod Ready but the operator still reports {op.state(spec).phase}")
@@ -140,7 +142,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                            f"reported reconciled for {seconds}s while only {worst}/{spec.hosts} servers were Ready")
 
         # data and writes after recovery
-        if ctx.recovered_at is not None:
+        if ctx.recovered_at is not None and exp.cluster_survives:
             for f in workload.write(200):
                 f.check = "writes after recovery"
                 result.findings.append(f)
