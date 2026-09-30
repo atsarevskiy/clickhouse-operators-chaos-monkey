@@ -270,10 +270,17 @@ class Workload:
         """Every batch the stream saw acknowledged must be stored exactly once, on every replica."""
         findings: list[Finding] = []
         acked, failed = set(), set()
-        for r in self._probe_lines("ingest-stream", 0):
+        # Read the log, then stop the writer, so nothing lands while replicas are compared. A batch
+        # can be in flight when the writer stops; it is logged by neither outcome, so everything
+        # above the last logged sequence number is left out of the comparison.
+        lines = self._probe_lines("ingest-stream", 0)
+        self.op.kube.delete("pod", "ingest-stream", namespace=self.spec.namespace, grace=0, force=True)
+        for r in lines:
             kv = dict(p.split("=", 1) for p in r[1:])
             seq = int(kv.get("seq", "0"))
             (acked if kv.get("ack") == "ok" else failed).add(seq)
+        last = max(acked | failed, default=0)
+        time.sleep(3)
         ready = [p["metadata"]["name"] for p in self.op.server_pods(self.spec) if pod_ready(p)]
         for name in ready:
             self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {STREAM_LOCAL}", timeout=sync_timeout)
@@ -293,7 +300,8 @@ class Workload:
                 if rc != 0:
                     findings.append(Finding("fail", "stream", f"{name}: cannot read the stream table: {out.strip()[:200]}"))
                     continue
-                counts = {int(a): int(b) for a, b in (ln.split("\t") for ln in out.strip().splitlines() if ln)}
+                counts = {int(a): int(b) for a, b in (ln.split("\t") for ln in out.strip().splitlines() if ln)
+                          if int(a) <= last}
                 counts_by_replica.append((name, counts))
                 for seq, n in counts.items():
                     per_seq_best[seq] = max(per_seq_best.get(seq, 0), n)

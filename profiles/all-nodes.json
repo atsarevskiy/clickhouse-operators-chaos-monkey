@@ -1,0 +1,20 @@
+{
+  "targets": [
+    {
+      "operator": "altinity",
+      "version": "0.27.4",
+      "scenarios": [
+        "node-drain",
+        "node-stop"
+      ]
+    },
+    {
+      "operator": "clickhouse",
+      "version": "0.0.8",
+      "scenarios": [
+        "node-drain",
+        "node-stop"
+      ]
+    }
+  ]
+}
