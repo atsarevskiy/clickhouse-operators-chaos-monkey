@@ -121,6 +121,10 @@ class OperatorAdapter(abc.ABC):
     def keeper_port(self) -> int:
         return 2181
 
+    #: database engine for the workload's database. Atomic: tables are created on every replica
+    #: and a new replica gets them from the operator. Replicated: DDL runs once and the database
+    #: engine carries it to every replica.
+    workload_database_engine: str = "Atomic"
     #: credentials the adapter provisions for the test workload
     workload_user: str = "chaos"
     workload_password: str = "chaos"

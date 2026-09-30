@@ -29,6 +29,8 @@ class Workload:
         self.spec = spec
         self.expected: dict[int, int] = {s: 0 for s in range(spec.shards)}
         self.next_id = 0
+        #: what extra rows mean; a scenario that removes and re-adds a shard calls it resurrection
+        self.surplus_label = "data duplication"
 
     # ---------- data ----------
 
@@ -61,8 +63,9 @@ class Workload:
 
     def setup(self) -> list[Finding]:
         findings = []
-        ddl = [
-            f"CREATE DATABASE IF NOT EXISTS {DB}",
+        engine = self.op.workload_database_engine
+        replicated_db = engine.startswith("Replicated")
+        tables = [
             f"CREATE TABLE IF NOT EXISTS {LOCAL} (id UInt64, shard UInt8, ts DateTime DEFAULT now()) "
             f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{DB}/events', '{{replica}}') ORDER BY id",
             f"CREATE TABLE IF NOT EXISTS {DIST} AS {LOCAL} "
@@ -72,13 +75,29 @@ class Workload:
             f"CREATE TABLE IF NOT EXISTS {PROBE_DIST} AS {LOCAL} "
             f"ENGINE = Distributed('{self.op.cluster_name(self.spec)}', {DB}, probe, shard)",
         ]
-        for pod in self.op.server_pods(self.spec):
-            name = pod["metadata"]["name"]
-            for q in ddl:
+        if replicated_db:
+            # Replicated database: the engine carries DDL to every replica, and it rejects
+            # explicit replication paths, so tables use its defaults.
+            tables = [q.replace("ReplicatedMergeTree('/clickhouse/tables/{shard}/chaos/events', '{replica}')",
+                                "ReplicatedMergeTree")
+                       .replace("ReplicatedMergeTree('/clickhouse/tables/{shard}/chaos/probe', '{replica}')",
+                                "ReplicatedMergeTree") for q in tables]
+        pods = [p["metadata"]["name"] for p in self.op.server_pods(self.spec)]
+        for name in pods:
+            rc, out = self.op.sql(self.spec, name, f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = {engine}")
+            if rc != 0:
+                findings.append(Finding("fail", "workload setup", f"{name}: {out.strip()[:300]}"))
+        targets = pods[:1] if replicated_db else pods
+        for name in targets:
+            for q in tables:
                 rc, out = self.op.sql(self.spec, name, q)
                 if rc != 0:
                     findings.append(Finding("fail", "workload setup", f"{name}: {out.strip()[:300]}"))
                     break
+        if replicated_db:
+            ok = wait_until(lambda: all((self.table_count(n) or 0) >= 4 for n in pods), timeout=120)
+            if ok is None:
+                findings.append(Finding("fail", "workload setup", "Replicated database did not reach every replica"))
         return findings
 
     def write(self, rows_per_shard: int = 1000) -> list[Finding]:
@@ -118,7 +137,8 @@ class Workload:
                 if got < want:
                     findings.append(Finding("fail", "data loss", f"{name} (shard {shard}) has {got} rows, expected {want}"))
                 elif got > want:
-                    findings.append(Finding("warn", "data duplication", f"{name} (shard {shard}) has {got} rows, expected {want}"))
+                    findings.append(Finding("warn", self.surplus_label,
+                                            f"{name} (shard {shard}) has {got} rows, expected {want}"))
         return findings
 
     # ---------- probes ----------

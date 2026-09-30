@@ -29,6 +29,19 @@ def _image(ref: str) -> dict:
     return {"repository": repo, "tag": tag}
 
 
+def _nested(flat: dict) -> dict:
+    """Settings are written as slash paths ("zookeeper/session_timeout_ms") across adapters; this
+    operator takes a nested config tree."""
+    out: dict = {}
+    for key, value in flat.items():
+        node = out
+        parts = key.split("/")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return out
+
+
 def _version_tuple(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in v.lstrip("v").split(".") if x.isdigit())
 
@@ -43,6 +56,9 @@ class ClickHouseOperator(OperatorAdapter):
     # so StatefulSets are never deleted and recreated for them
     capabilities = frozenset({"pod-labels"})
     tuning: dict = {}
+    # This operator creates and syncs schema for Replicated databases on new replicas; a plain
+    # Atomic database is left to the user, so the workload uses the engine the operator manages.
+    workload_database_engine = "Replicated('/clickhouse/databases/chaos', '{shard}', '{replica}')"
 
     @property
     def tag(self) -> str:
@@ -129,8 +145,8 @@ class ClickHouseOperator(OperatorAdapter):
                     "resources": {"requests": {"cpu": "50m", "memory": "200Mi"}, "limits": {"memory": "512Mi"}},
                 },
                 "dataVolumeClaimSpec": self._pvc(spec),
-                "settings": {"extraConfig": {"keeper_server": {"four_letter_word_white_list": "*"},
-                                             **spec.keeper_settings}},
+                "settings": {"extraConfig": _nested({"keeper_server/four_letter_word_white_list": "*",
+                                                     **spec.keeper_settings})},
             },
         }
         chc = {
@@ -148,7 +164,7 @@ class ClickHouseOperator(OperatorAdapter):
                 },
                 "dataVolumeClaimSpec": self._pvc(spec),
                 "settings": {
-                    "extraConfig": dict(spec.server_settings),
+                    "extraConfig": _nested(spec.server_settings),
                     "extraUsersConfig": {"users": {self.workload_user: {
                         "password": self.workload_password, "networks": {"ip": "::/0"}, "profile": "default"}}},
                 },

@@ -58,6 +58,13 @@ class Scenario:
     performance: bool = False
     #: adapter capabilities the trigger needs (see OperatorAdapter.capabilities)
     requires: frozenset = frozenset()
+    #: touches something shared by every namespace (the operator, a node, cluster-wide API load),
+    #: so it runs alone after the parallel batch
+    exclusive: bool = False
+
+    @property
+    def runs_alone(self) -> bool:
+        return self.exclusive or self.category in ("operator", "infrastructure", "performance")
 
     def spec_for(self, base: ClusterSpec) -> ClusterSpec:
         return base.copy(shards=max(base.shards, self.min_shards),

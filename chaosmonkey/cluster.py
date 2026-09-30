@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 
 from .kube import Kube, wait_until
@@ -34,6 +35,9 @@ class K3dCluster:
         self.context = f"k3d-{name}"
         self.kube = Kube(self.context)
         self._policy_dir = Path(tempfile.gettempdir()) / f"chaosmonkey-{name}"
+        # k3d runs imports through one tools node per cluster, so concurrent imports collide
+        self._import_lock = threading.Lock()
+        self._imported: set[str] = set()
 
     @property
     def server_node(self) -> str:
@@ -76,6 +80,7 @@ class K3dCluster:
 
     def delete(self) -> None:
         subprocess.run(["k3d", "cluster", "delete", self.name], capture_output=True, text=True)
+        self._imported.clear()
 
     def ready_nodes(self) -> list[str]:
         ready = []
@@ -87,14 +92,15 @@ class K3dCluster:
 
     def import_images(self, images: list[str]) -> None:
         """Pull on the host once and import, so no pod waits on a registry mid-scenario."""
-        present = []
-        for image in images:
-            if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
-                subprocess.run(["docker", "pull", "-q", image], check=True, capture_output=True)
-            present.append(image)
-        if present:
-            subprocess.run(["k3d", "image", "import", "-c", self.name, *present],
-                           check=True, capture_output=True, text=True)
+        with self._import_lock:
+            todo = [i for i in images if i not in self._imported]
+            for image in todo:
+                if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode != 0:
+                    subprocess.run(["docker", "pull", "-q", image], check=True, capture_output=True)
+            if todo:
+                subprocess.run(["k3d", "image", "import", "-c", self.name, *todo],
+                               check=True, capture_output=True, text=True)
+                self._imported.update(todo)
 
     def audit_events(self, since: str, username: str | None = None) -> list[dict]:
         """ResponseComplete events since an RFC3339 timestamp, optionally for one user."""

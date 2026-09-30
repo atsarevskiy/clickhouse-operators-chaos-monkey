@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from pathlib import Path
 
@@ -18,8 +20,14 @@ from .workload import Workload
 BASELINE_TIMEOUT_S = 900
 
 
+_print_lock = threading.Lock()
+
+
 def _log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    name = threading.current_thread().name
+    tag = "" if name == "MainThread" else f"[{name}] "
+    with _print_lock:
+        print(f"[{time.strftime('%H:%M:%S')}] {tag}{msg}", flush=True)
 
 
 def drop_namespace(op: OperatorAdapter, ns: str) -> None:
@@ -191,7 +199,9 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         scenario.verify(ctx)
 
         # API cost of handling the scenario
-        events = cluster.audit_events(audit_since, op.operator_username)
+        # per namespace, so scenarios running side by side don't count each other's requests
+        events = [e for e in cluster.audit_events(audit_since, op.operator_username)
+                  if (e.get("objectRef") or {}).get("namespace") == spec.namespace]
         verbs = Counter(e.get("verb") for e in events)
         result.measure("api_requests", len(events), "requests")
         result.measure("api_requests_per_host", len(events) / max(spec.hosts, 1), "requests")
@@ -223,25 +233,43 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                 op.kube.run("get", "events", "-n", spec.namespace, "--sort-by=.lastTimestamp", check=False))
         except Exception:  # noqa: BLE001
             pass
-        restore_infrastructure(op, cluster)
+        if scenario.runs_alone:
+            restore_infrastructure(op, cluster)
         drop_namespace(op, spec.namespace)
 
 
 def run_target(op: OperatorAdapter, cluster: K3dCluster, scenarios: list[Scenario], base: ClusterSpec,
-               out_dir: Path, env: dict[str, str] | None = None) -> list[ScenarioResult]:
+               out_dir: Path, env: dict[str, str] | None = None, concurrency: int = 3) -> list[ScenarioResult]:
+    """Namespace-local scenarios run `concurrency` at a time; the ones that touch the operator, a
+    node or cluster-wide load run one by one afterwards, with nothing else in flight."""
     out_dir.mkdir(parents=True, exist_ok=True)
     _log(f"cluster {cluster.name}: creating")
     cluster.create()
     _log(f"operator {op.name} {op.version}: installing")
     op.install(env)
-    results = []
-    for i, scenario in enumerate(scenarios, 1):
-        _log(f"[{i}/{len(scenarios)}] {scenario.id}")
+    shared = [s for s in scenarios if not s.runs_alone]
+    alone = [s for s in scenarios if s.runs_alone]
+    results: dict[str, ScenarioResult] = {}
+    lock = threading.Lock()
+
+    def one(scenario: Scenario) -> None:
+        threading.current_thread().name = f"{op.name} {scenario.id}"
+        _log("start")
         r = run_scenario(op, cluster, scenario, base, out_dir)
-        _log(f"  -> {r.verdict} {r.summary}")
+        _log(f"-> {r.verdict} {r.summary} ({r.duration_s:.0f}s)")
         for f in r.findings:
             if f.severity in ("fail", "warn"):
-                _log(f"     {f.severity}: {f.check}: {f.detail}")
-        results.append(r)
-        (out_dir / "results.json").write_text(json.dumps([x.to_dict() for x in results], indent=1))
-    return results
+                _log(f"   {f.severity}: {f.check}: {f.detail}")
+        with lock:
+            results[scenario.id] = r
+            ordered = [results[s.id] for s in scenarios if s.id in results]
+            (out_dir / "results.json").write_text(json.dumps([x.to_dict() for x in ordered], indent=1))
+
+    if shared:
+        _log(f"{len(shared)} scenarios in parallel ({concurrency} at a time), then {len(alone)} alone")
+        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+            list(pool.map(one, shared))
+    for scenario in alone:
+        one(scenario)
+    threading.current_thread().name = "MainThread"
+    return [results[s.id] for s in scenarios if s.id in results]

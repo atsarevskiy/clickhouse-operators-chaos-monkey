@@ -84,7 +84,8 @@ from the audit log.
 | network | `replica-network-isolation` | NetworkPolicy isolates one replica completely |
 | performance | `perf-rolling-restart` / `perf-scale-out` / `perf-operator-restart` | time and API cost at 4x2 hosts |
 
-Profiles: `smoke` (5 scenarios), `standard` (22), `full` (29), `perf` (3), `all`.
+Profiles: `smoke` (5 scenarios), `standard` (22), `tracker` (9, written from the operators' issue
+trackers), `full` (38), `perf` (3), `all`.
 
 Some triggers depend on what an operator supports. A scenario whose requirement an adapter doesn't
 declare is reported SKIPPED with the reason, not FAIL. For example, the ClickHouse operator has no
@@ -122,8 +123,12 @@ A matrix file lists targets; each gets a fresh cluster:
 Useful options: `--shards/--replicas/--keepers` for the base topology (default 2x2 plus 3
 Keepers), `--server-image/--keeper-image`, `--agents` for worker nodes, `--keep-cluster`.
 
-Each target takes a while: a scenario runs 3 to 10 minutes including a fresh baseline, so
-`standard` is roughly two to three hours per operator build.
+A scenario runs 2 to 10 minutes including its own fresh baseline, and most of that is the
+operator creating the cluster, not the failure. Scenarios that stay inside their own namespace run
+`--concurrency` at a time (default 3); the ones that touch the operator, a node, or cluster-wide
+API load run alone afterwards. `matrix --parallel-targets` also runs every operator build at once,
+each on its own k3d cluster. The `tracker` profile on two operators takes about 45 minutes that way,
+against roughly two and a half hours one scenario at a time.
 
 **Host limits.** Every k3d node runs a kubelet that needs inotify instances. If other local
 clusters are running, a new node's kubelet can fail with `inotify_init: too many open files` and

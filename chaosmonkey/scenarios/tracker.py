@@ -88,6 +88,8 @@ class ScaleDownShardLeavesMetadata(Scenario):
 
     def inject(self, ctx: Context) -> None:
         self.full = ctx.spec
+        # rows found on a re-added shard were written before it was removed: stale data coming back
+        ctx.workload.surplus_label = "stale data resurrected on re-added shard"
         ctx.notes["removed_shard"] = ctx.spec.shards - 1
         ctx.reapply(ctx.spec.copy(shards=ctx.spec.shards - 1))
         wait_until(lambda: len(ctx.op.server_pods(ctx.spec)) == ctx.spec.hosts, timeout=600, interval=3)
@@ -317,7 +319,7 @@ class DeletionWithoutOperator(Scenario):
 
     def __init__(self):
         super().__init__(
-            id="cluster-deleted-while-operator-down", category="lifecycle",
+            id="cluster-deleted-while-operator-down", category="lifecycle", exclusive=True,
             related_issues=["Altinity/clickhouse-operator#1775"],
             title="Delete the cluster while the operator is down, then bring it back",
             description="A delete requested with no operator running must complete once the operator returns, "

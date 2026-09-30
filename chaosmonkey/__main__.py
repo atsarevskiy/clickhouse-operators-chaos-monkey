@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor
 import sys
 import time
 from pathlib import Path
@@ -29,7 +30,8 @@ def _run_one(target: dict, args: argparse.Namespace, out_root: Path) -> list:
     if args.fresh_cluster and cluster.exists():
         cluster.delete()
     try:
-        results = run_target(op, cluster, chosen, _base_spec(args), out, env=target.get("env"))
+        results = run_target(op, cluster, chosen, _base_spec(args), out, env=target.get("env"),
+                             concurrency=args.concurrency)
     finally:
         if not args.keep_cluster:
             cluster.delete()
@@ -54,10 +56,18 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     config = json.loads(Path(args.config).read_text())
     out_root = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
     args.profile = config.get("profile", args.profile)
-    for target in config["targets"]:
-        args.fresh_cluster = True
-        _run_one(target, args, out_root)
-        _write_report(out_root)
+    args.fresh_cluster = True
+    targets = config["targets"]
+    if args.parallel_targets and len(targets) > 1:
+        # one k3d cluster per target, all at once; each cluster adds kubelets, see README on inotify
+        for i, target in enumerate(targets):
+            target.setdefault("cluster", f"{args.cluster}-{i}")
+        with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+            list(pool.map(lambda tg: _run_one(tg, args, out_root), targets))
+    else:
+        for target in targets:
+            _run_one(target, args, out_root)
+            _write_report(out_root)
     return _write_report(out_root)
 
 
@@ -104,6 +114,8 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--out", default="results")
         sp.add_argument("--keep-cluster", action="store_true", help="leave the k3d cluster running afterwards")
         sp.add_argument("--fresh-cluster", action="store_true", help="delete an existing cluster of the same name first")
+        sp.add_argument("--concurrency", type=int, default=3,
+                        help="namespace-local scenarios run this many at a time (1 = sequential)")
 
     r = sub.add_parser("run", help="run scenarios against one operator build")
     r.add_argument("--operator", required=True, choices=sorted(operators.ADAPTERS))
@@ -115,6 +127,8 @@ def main(argv: list[str] | None = None) -> int:
 
     m = sub.add_parser("matrix", help="run a list of operator builds from a JSON file, one fresh cluster each")
     m.add_argument("config")
+    m.add_argument("--parallel-targets", action="store_true",
+                   help="run every target at once, each on its own k3d cluster")
     common(m)
     m.set_defaults(fn=cmd_matrix)
 
