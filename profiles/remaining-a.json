@@ -1,0 +1,66 @@
+{
+  "targets": [
+    {
+      "operator": "altinity",
+      "version": "0.27.4",
+      "scenarios": [
+        "shard-all-replicas-kill",
+        "all-servers-kill",
+        "server-process-crash",
+        "keeper-quorum-loss",
+        "keeper-all-kill",
+        "operator-kill-mid-rollout",
+        "operator-down-during-failure",
+        "operator-kill-mid-keeper-repair",
+        "query-service-deleted",
+        "configmaps-deleted-then-restart",
+        "replica-volume-lost",
+        "scale-up-replica",
+        "scale-up-shard",
+        "invalid-spec-no-damage",
+        "bad-config-rollout",
+        "replica-keeper-partition",
+        "replica-network-isolation",
+        "scale-down-replica",
+        "server-version-upgrade",
+        "recreate-on-immutable-change",
+        "unschedulable-replacement",
+        "wedged-shutdown-recreate",
+        "perf-rolling-restart",
+        "perf-scale-out",
+        "perf-operator-restart"
+      ]
+    },
+    {
+      "operator": "clickhouse",
+      "version": "0.0.8",
+      "scenarios": [
+        "shard-all-replicas-kill",
+        "all-servers-kill",
+        "server-process-crash",
+        "keeper-quorum-loss",
+        "keeper-all-kill",
+        "operator-kill-mid-rollout",
+        "operator-down-during-failure",
+        "operator-kill-mid-keeper-repair",
+        "query-service-deleted",
+        "configmaps-deleted-then-restart",
+        "replica-volume-lost",
+        "scale-up-replica",
+        "scale-up-shard",
+        "invalid-spec-no-damage",
+        "bad-config-rollout",
+        "replica-keeper-partition",
+        "replica-network-isolation",
+        "scale-down-replica",
+        "server-version-upgrade",
+        "recreate-on-immutable-change",
+        "unschedulable-replacement",
+        "wedged-shutdown-recreate",
+        "perf-rolling-restart",
+        "perf-scale-out",
+        "perf-operator-restart"
+      ]
+    }
+  ]
+}

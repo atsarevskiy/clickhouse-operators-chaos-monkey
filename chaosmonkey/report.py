@@ -10,8 +10,11 @@ POINTS = {"PASS": 100, "DEGRADED": 50, "FAIL": 0}
 KEY_MEASURES = [
     ("time_to_recover_s", "recover s"),
     ("time_to_status_healthy_s", "status s"),
-    ("read_availability_pct", "read %"),
-    ("write_availability_pct", "write %"),
+    ("longest_read_outage_s", "read outage s"),
+    ("longest_write_outage_s", "write outage s"),
+    ("stream_insert_p99_ms", "insert p99 ms"),
+    ("stream_read_p99_ms", "read p99 ms"),
+    ("stream_acked_batches_lost", "acked lost"),
     ("keeper_min_serving", "keeper min"),
     ("api_requests", "API calls"),
 ]
@@ -105,6 +108,22 @@ def scorecard(results: list[dict]) -> str:
                       for m in r["measurements"] if m["name"] == "time_to_recover_s" and m["value"] is not None)
         medians.append(f"{vals[len(vals) // 2]:g}" if vals else "-")
     lines.append("| **median recover (recovered scenarios only)** | " + " | ".join(medians) + " |")
+    lines.append("")
+
+    lines += ["## Impact on a live ingest stream", "",
+              "A client writes a 100-row batch every second and reads every second through the cluster "
+              "Service throughout each scenario. `outage` = longest run of failed seconds; `p99` = latency; "
+              "`lost` = batches the client saw acknowledged that are not stored (must be 0).", "",
+              "| Scenario | " + " | ".join(f"{o} {v} write outage s / insert p99 ms / read p99 ms / lost" for o, v in targets) + " |",
+              "|---|" + "---|" * len(targets)]
+    for s in scenarios:
+        row = [s]
+        for o, v in targets:
+            r = index.get((o, v, s))
+            row.append(" / ".join(_m(r, k) for k in ("longest_write_outage_s", "stream_insert_p99_ms",
+                                                      "stream_read_p99_ms", "stream_acked_batches_lost"))
+                       if r else "-")
+        lines.append("| " + " | ".join(row) + " |")
     lines.append("")
 
     perf = [r for r in results if r["category"] == "performance"]

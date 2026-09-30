@@ -21,6 +21,12 @@ DIST = f"{DB}.events_all"
 # The availability probe writes to its own table so it never changes the counts verify() checks.
 PROBE_LOCAL = f"{DB}.probe"
 PROBE_DIST = f"{DB}.probe_all"
+# The ingest stream: a batch of STREAM_BATCH rows every second, ids STREAM_BASE + seq * 1000 + n,
+# so afterwards every batch the client saw acknowledged can be looked up by its sequence number.
+STREAM_LOCAL = f"{DB}.stream"
+STREAM_DIST = f"{DB}.stream_all"
+STREAM_BASE = 2_000_000_000_000
+STREAM_BATCH = 100
 
 
 class Workload:
@@ -74,6 +80,10 @@ class Workload:
             f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{DB}/probe', '{{replica}}') ORDER BY id",
             f"CREATE TABLE IF NOT EXISTS {PROBE_DIST} AS {LOCAL} "
             f"ENGINE = Distributed('{self.op.cluster_name(self.spec)}', {DB}, probe, shard)",
+            f"CREATE TABLE IF NOT EXISTS {STREAM_LOCAL} AS {LOCAL} "
+            f"ENGINE = ReplicatedMergeTree('/clickhouse/tables/{{shard}}/{DB}/stream', '{{replica}}') ORDER BY id",
+            f"CREATE TABLE IF NOT EXISTS {STREAM_DIST} AS {LOCAL} "
+            f"ENGINE = Distributed('{self.op.cluster_name(self.spec)}', {DB}, stream, shard)",
         ]
         if replicated_db:
             # Replicated database: the engine carries DDL to every replica, and it rejects
@@ -81,6 +91,8 @@ class Workload:
             tables = [q.replace("ReplicatedMergeTree('/clickhouse/tables/{shard}/chaos/events', '{replica}')",
                                 "ReplicatedMergeTree")
                        .replace("ReplicatedMergeTree('/clickhouse/tables/{shard}/chaos/probe', '{replica}')",
+                                "ReplicatedMergeTree")
+                       .replace("ReplicatedMergeTree('/clickhouse/tables/{shard}/chaos/stream', '{replica}')",
                                 "ReplicatedMergeTree") for q in tables]
         pods = [p["metadata"]["name"] for p in self.op.server_pods(self.spec)]
         for name in pods:
@@ -95,7 +107,7 @@ class Workload:
                     findings.append(Finding("fail", "workload setup", f"{name}: {out.strip()[:300]}"))
                     break
         if replicated_db:
-            ok = wait_until(lambda: all((self.table_count(n) or 0) >= 4 for n in pods), timeout=120)
+            ok = wait_until(lambda: all((self.table_count(n) or 0) >= 6 for n in pods), timeout=120)
             if ok is None:
                 findings.append(Finding("fail", "workload setup", "Replicated database did not reach every replica"))
         return findings
@@ -148,11 +160,21 @@ class Workload:
         svc = self.op.query_service(self.spec)
         user, pw = self.op.workload_user, self.op.workload_password
         client = f"clickhouse-client -h {svc} --user {user} --password {pw} --connect_timeout 1 --receive_timeout 3 --send_timeout 3"
+        ms = "$(($(date +%s%N)/1000000))"
         query_loop = (
             "i=0; while true; do i=$((i+1)); "
-            f"if {client} -q 'SELECT count() FROM {DIST}' >/dev/null 2>&1; then r=ok; else r=fail; fi; "
+            f"t0={ms}; if {client} -q 'SELECT count() FROM {DIST}' >/dev/null 2>&1; then r=ok; else r=fail; fi; t1={ms}; "
             f"if {client} --insert_distributed_sync 1 -q \"INSERT INTO {PROBE_DIST} (id, shard) VALUES ($((1000000000+i)), $((i % {self.spec.shards})))\" >/dev/null 2>&1; then w=ok; else w=fail; fi; "
-            "echo \"$(date +%s) read=$r write=$w\"; sleep 1; done"
+            "echo \"$(date +%s) read=$r write=$w read_ms=$((t1-t0))\"; sleep 1; done"
+        )
+        # One batch per second. A batch counts as acknowledged only when the client got success
+        # from a synchronous distributed insert; the check afterwards looks each one up.
+        stream_loop = (
+            "s=0; while true; do s=$((s+1)); "
+            f"t0={ms}; if {client} --insert_distributed_sync 1 -q \"INSERT INTO {STREAM_DIST} (id, shard) "
+            f"SELECT {STREAM_BASE} + $s * 1000 + number, $((s % {self.spec.shards})) FROM numbers({STREAM_BATCH})\" "
+            f">/dev/null 2>&1; then a=ok; else a=fail; fi; t1={ms}; "
+            "echo \"$(date +%s) seq=$s ack=$a ms=$((t1-t0))\"; sleep 1; done"
         )
         hosts = " ".join(self.op.keeper_hosts(self.spec))
         port = self.op.keeper_port
@@ -165,10 +187,11 @@ class Workload:
         pods = [
             self._probe_pod("query-probe", image, query_loop),
             self._probe_pod("keeper-probe", self.spec.keeper_image, keeper_loop),
+            self._probe_pod("ingest-stream", image, stream_loop),
         ]
         self.op.kube.apply(pods, namespace=ns)
         wait_until(lambda: all(pod_ready(p) for p in self.op.kube.items("pods", ns, "chaosmonkey=probe"))
-                   and len(self.op.kube.items("pods", ns, "chaosmonkey=probe")) == 2, timeout=120)
+                   and len(self.op.kube.items("pods", ns, "chaosmonkey=probe")) == len(pods), timeout=120)
 
     @staticmethod
     def _probe_pod(name: str, image: str, loop: str) -> dict:
@@ -207,6 +230,95 @@ class Workload:
         write_pct, write_gap = stats("write")
         return {"samples": len(rows), "read_pct": read_pct, "read_longest_outage_s": read_gap,
                 "write_pct": write_pct, "write_longest_outage_s": write_gap}
+
+    @staticmethod
+    def _pct(values: list[float], q: float) -> float | None:
+        if not values:
+            return None
+        values = sorted(values)
+        return values[min(len(values) - 1, int(q * (len(values) - 1) + 0.5))]
+
+    def stream_stats(self, since: float, until: float) -> dict:
+        """Latency and throughput of the ingest stream between since and until."""
+        rows = [dict(p.split("=", 1) for p in r[1:]) | {"t": int(r[0])}
+                for r in self._probe_lines("ingest-stream", 0) if since <= int(r[0]) <= until]
+        acked = [r for r in rows if r.get("ack") == "ok"]
+        lat = [float(r["ms"]) for r in acked if r.get("ms", "").lstrip("-").isdigit()]
+        # rows acknowledged per 10 s window; the slowest window shows the dip in throughput
+        windows: dict[int, int] = {}
+        for r in rows:
+            windows.setdefault(r["t"] // 10, 0)
+            if r.get("ack") == "ok":
+                windows[r["t"] // 10] += STREAM_BATCH
+        # the first and last windows are partial, so they would read as a dip that isn't there
+        if len(windows) > 2:
+            for edge in (min(windows), max(windows)):
+                windows.pop(edge, None)
+        reads = [float(dict(p.split("=", 1) for p in r[1:]).get("read_ms", "nan"))
+                 for r in self._probe_lines("query-probe", since) if int(r[0]) <= until]
+        reads = [x for x in reads if x == x]
+        return {
+            "batches": len(rows), "batches_acked": len(acked),
+            "insert_p50_ms": self._pct(lat, 0.5), "insert_p99_ms": self._pct(lat, 0.99),
+            "insert_max_ms": max(lat) if lat else None,
+            "read_p50_ms": self._pct(reads, 0.5), "read_p99_ms": self._pct(reads, 0.99),
+            "min_rows_per_10s": min(windows.values()) if windows else None,
+            "median_rows_per_10s": self._pct(list(windows.values()), 0.5),
+        }
+
+    def stream_integrity(self, sync_timeout: int = 120) -> tuple[dict, list[Finding]]:
+        """Every batch the stream saw acknowledged must be stored exactly once, on every replica."""
+        findings: list[Finding] = []
+        acked, failed = set(), set()
+        for r in self._probe_lines("ingest-stream", 0):
+            kv = dict(p.split("=", 1) for p in r[1:])
+            seq = int(kv.get("seq", "0"))
+            (acked if kv.get("ack") == "ok" else failed).add(seq)
+        ready = [p["metadata"]["name"] for p in self.op.server_pods(self.spec) if pod_ready(p)]
+        for name in ready:
+            self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {STREAM_LOCAL}", timeout=sync_timeout)
+        # per shard, per replica: count rows per batch on every replica so a replica that is
+        # missing batches, or holds extras, is caught even if its peer is complete
+        per_seq_best: dict[int, int] = {}
+        diverged = []
+        for shard in range(self.spec.shards):
+            counts_by_replica = []
+            for pod in self.op.server_pods(self.spec, shard=shard):
+                if not pod_ready(pod):
+                    continue
+                name = pod["metadata"]["name"]
+                rc, out = self.op.sql(self.spec, name,
+                                      f"SELECT intDiv(id - {STREAM_BASE}, 1000) AS seq, count() FROM {STREAM_LOCAL} "
+                                      f"WHERE id >= {STREAM_BASE} GROUP BY seq FORMAT TSV")
+                if rc != 0:
+                    findings.append(Finding("fail", "stream", f"{name}: cannot read the stream table: {out.strip()[:200]}"))
+                    continue
+                counts = {int(a): int(b) for a, b in (ln.split("\t") for ln in out.strip().splitlines() if ln)}
+                counts_by_replica.append((name, counts))
+                for seq, n in counts.items():
+                    per_seq_best[seq] = max(per_seq_best.get(seq, 0), n)
+            if len(counts_by_replica) > 1:
+                ref_name, ref = counts_by_replica[0]
+                for name, c in counts_by_replica[1:]:
+                    if c != ref:
+                        diverged.append(f"{name} vs {ref_name}")
+        lost = sorted(s for s in acked if per_seq_best.get(s, 0) < STREAM_BATCH)
+        dup = sorted(s for s, n in per_seq_best.items() if n > STREAM_BATCH)
+        landed_despite_error = sorted(s for s in failed if per_seq_best.get(s, 0) >= STREAM_BATCH)
+        stats = {"batches_acked_total": len(acked), "batches_failed_total": len(failed),
+                 "acked_batches_lost": len(lost), "batches_duplicated": len(dup),
+                 "failed_batches_stored_anyway": len(landed_despite_error),
+                 "replicas_diverged": len(diverged)}
+        if lost:
+            findings.append(Finding("fail", "acknowledged writes lost",
+                                    f"{len(lost)} of {len(acked)} acknowledged batches missing or partial "
+                                    f"(first seq {lost[:5]})"))
+        if dup:
+            findings.append(Finding("warn", "stream duplicates", f"{len(dup)} batches stored more than once (seq {dup[:5]})"))
+        if diverged:
+            findings.append(Finding("fail", "replica divergence",
+                                    f"replicas of the same shard hold different stream data: {', '.join(diverged[:4])}"))
+        return stats, findings
 
     def keeper_leaderless(self, since: float, until: float | None = None) -> dict:
         """Longest run of consecutive samples in which no member reported itself leader."""

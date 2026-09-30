@@ -9,7 +9,8 @@ from .changes import (ImmutableFieldChange, InvalidSpecRejected, KeeperPartition
                       WedgedShutdownRecreate)
 from .tracker import (DeletionWithoutOperator, ForegroundDeletion, KeeperRollingRestart,
                       KeeperStatefulSetDeleted, MigrationFailureMarkedDone, ReplicaServesBeforeSchema,
-                      RestartDuringSlowStart, ScaleDownLeavesReplicaMetadata, ScaleDownShardLeavesMetadata)
+                      RestartDuringSlowStart, ScaleDownLeavesReplicaMetadata, ScaleDownShardLeavesMetadata,
+                      StorageClassChange, StuckTerminatingPod, UnschedulableRollout)
 from .failures import (AllServersKill, BadConfigRollout, ConfigMapsDeletedThenRestart, KeeperAllKill,
                        KeeperMemberKill, KeeperQuorumLoss, OperatorDownDuringFailure, OperatorKillIdle,
                        OperatorKillMidDriftRepair, OperatorKillMidRollout, PvcDeleted, ServerPodKill,
@@ -29,6 +30,8 @@ ALL: list[Scenario] = [
     ScaleDownLeavesReplicaMetadata(), ScaleDownShardLeavesMetadata(), ReplicaServesBeforeSchema(),
     MigrationFailureMarkedDone(), KeeperStatefulSetDeleted(), ForegroundDeletion(),
     DeletionWithoutOperator(), KeeperRollingRestart(), RestartDuringSlowStart(),
+    # operator-neutral versions of the three capability-dependent scenarios
+    StuckTerminatingPod(), UnschedulableRollout(), StorageClassChange(),
 ]
 BY_ID = {s.id: s for s in ALL}
 
@@ -44,6 +47,7 @@ _STANDARD = _SMOKE + [
 _FULL = _STANDARD + [
     "scale-down-replica", "server-version-upgrade", "recreate-on-immutable-change",
     "unschedulable-replacement", "wedged-shutdown-recreate", "node-drain", "node-stop",
+    "stuck-terminating-pod", "unschedulable-rollout", "storage-class-change",
 ]
 _TRACKER = [
     "keeper-statefulset-deleted", "cluster-deleted-foreground", "cluster-deleted-while-operator-down",

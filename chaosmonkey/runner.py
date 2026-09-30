@@ -183,6 +183,21 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                     and pct < pct_limit:
                 result.add("warn", "availability", f"{kind} availability {pct:.1f}% below {pct_limit}% "
                                                    f"over {avail['samples']} samples")
+        # the ingest stream: latency and throughput during the scenario, then whether every
+        # acknowledged batch was kept
+        s = workload.stream_stats(ctx.t_inject, t_end)
+        for key, unit in (("insert_p50_ms", "ms"), ("insert_p99_ms", "ms"), ("insert_max_ms", "ms"),
+                          ("read_p50_ms", "ms"), ("read_p99_ms", "ms"),
+                          ("min_rows_per_10s", "rows"), ("median_rows_per_10s", "rows")):
+            result.measure(f"stream_{key}", s[key], unit)
+        if exp.cluster_survives and ctx.recovered_at is not None:
+            integrity, stream_findings = workload.stream_integrity()
+            for key, value in integrity.items():
+                result.measure(f"stream_{key}", value, "count")
+            if not exp.data_must_survive:
+                for f in stream_findings:
+                    f.severity = "warn" if f.severity == "fail" else f.severity
+            result.findings.extend(stream_findings)
         quorum = workload.keeper_quorum(ctx.t_inject, t_end)
         result.measure("keeper_min_serving", quorum["min_serving"], "members")
         result.measure("keeper_longest_below_quorum_s", quorum["longest_below_quorum_s"], "s")

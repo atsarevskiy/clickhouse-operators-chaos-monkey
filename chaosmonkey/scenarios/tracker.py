@@ -431,3 +431,125 @@ class RestartDuringSlowStart(Scenario):
     def done(self, ctx: Context) -> bool:
         pods = ctx.op.server_pods(ctx.spec, shard=0, replica=0)
         return bool(pods) and all(pod_ready(p) for p in pods)
+
+
+# ---------------------------------------------------------------- operator-neutral versions
+# The scenarios above that need a preStop hook or a volume-template recreate are skipped on
+# operators without those features. These three test the same behaviour through triggers every
+# operator supports, so the comparison has no gaps.
+
+
+def _blast_radius(ctx: Context, samples: list[dict], label: str) -> None:
+    worst_shard = min((min(s["per_shard_ready"]) for s in samples), default=ctx.spec.replicas)
+    worst_keeper = min((s["keepers_ready"] for s in samples), default=ctx.spec.keepers)
+    ctx.result.measure("fault_min_ready_per_shard", worst_shard, "replicas")
+    ctx.result.measure("fault_min_ready_keepers", worst_keeper, "members")
+    if worst_shard == 0:
+        ctx.result.add("fail", "blast radius", f"a shard had no Ready replica while {label}")
+    if worst_keeper < ctx.spec.keepers // 2 + 1:
+        ctx.result.add("fail", "blast radius", f"Keeper fell to {worst_keeper} Ready members while {label}")
+
+
+class StuckTerminatingPod(Scenario):
+    """Operator-neutral version of wedged-shutdown-recreate: a pod that cannot finish terminating
+    during a rolling change. A pod finalizer holds it, which no operator can override."""
+
+    def __init__(self):
+        super().__init__(
+            id="stuck-terminating-pod", category="spec", min_replicas=2,
+            related_issues=["Altinity/clickhouse-operator#2078"],
+            title="A pod stuck terminating during a rolling change",
+            description="Hold one replica's pod in Terminating with a finalizer, then roll the pod template. "
+                        "The operator must not take down the stuck pod's peer, and must finish once it's released.",
+            expect=Expectations(recover_within_s=900, recover_slo_s=420,
+                                max_read_outage_s=None, min_read_availability_pct=None,
+                                max_write_outage_s=None, min_write_availability_pct=None))
+        self.hold_s = 240
+
+    def inject(self, ctx: Context) -> None:
+        pod = _pick(ctx, shard=0, replica=0)["metadata"]["name"]
+        ctx.notes["held"] = pod
+        ctx.kube.patch("pod", pod, ctx.spec.namespace, {"metadata": {"finalizers": ["chaosmonkey/hold"]}})
+        ctx.reapply(ctx.spec.copy(pod_annotations={**ctx.spec.pod_annotations, "chaosmonkey/roll": str(int(time.time()))}))
+        end = time.time() + self.hold_s
+        while time.time() < end:
+            ctx.snapshot()
+            time.sleep(3)
+        ctx.notes["fault_samples"] = list(ctx.samples)
+
+    def recover(self, ctx: Context) -> None:
+        pod = ctx.notes["held"]
+        if ctx.kube.get("pod", pod, ctx.spec.namespace):
+            ctx.kube.patch("pod", pod, ctx.spec.namespace, {"metadata": {"finalizers": None}})
+        ctx.mark_cleared()
+        ctx.await_recovery()
+
+    def done(self, ctx: Context) -> bool:
+        from .failures import rolled
+        return rolled(ctx)
+
+    def verify(self, ctx: Context) -> None:
+        _blast_radius(ctx, ctx.notes.get("fault_samples", []), "a pod was stuck terminating")
+
+
+class UnschedulableRollout(Scenario):
+    """Operator-neutral version of unschedulable-replacement: a pod template change whose pods can
+    never be scheduled, because no node carries the label it selects."""
+
+    def __init__(self):
+        super().__init__(
+            id="unschedulable-rollout", category="spec", min_replicas=2,
+            related_issues=["Altinity/clickhouse-operator#2069", "Altinity/clickhouse-operator#2078"],
+            title="Roll out pods that can never be scheduled",
+            description="Add a nodeSelector no node matches. The operator must stop after the first replacement "
+                        "stays Pending instead of taking down a shard or the Keeper quorum, then recover on revert.",
+            expect=Expectations(recover_within_s=900, recover_slo_s=420,
+                                max_read_outage_s=None, min_read_availability_pct=None,
+                                max_write_outage_s=None, min_write_availability_pct=None))
+        self.hold_s = 300
+
+    def inject(self, ctx: Context) -> None:
+        self.good = ctx.spec
+        ctx.reapply(ctx.spec.copy(node_selector={"chaosmonkey/no-such-node": "true"}))
+        end = time.time() + self.hold_s
+        while time.time() < end:
+            ctx.snapshot()
+            time.sleep(3)
+        ctx.notes["fault_samples"] = list(ctx.samples)
+
+    def recover(self, ctx: Context) -> None:
+        ctx.reapply(self.good)
+        ctx.mark_cleared()
+        ctx.await_recovery()
+
+    def verify(self, ctx: Context) -> None:
+        _blast_radius(ctx, ctx.notes.get("fault_samples", []), "replacements could not be scheduled")
+
+
+class StorageClassChange(Scenario):
+    """Operator-neutral version of recreate-on-immutable-change: point the data volumes at a
+    different StorageClass. A PVC's class is immutable, so each operator either recreates, applies
+    it to new volumes only, or reports that it can't; none of those may lose data or a shard."""
+
+    def __init__(self):
+        super().__init__(
+            id="storage-class-change", category="spec", min_replicas=2,
+            related_issues=["ClickHouse/clickhouse-operator#133"],
+            title="Change the data volumes' StorageClass",
+            description="Switch the volume claim to a second StorageClass with the same provisioner. Data must "
+                        "survive, no shard may lose every replica, and the status must end up telling the truth.",
+            expect=Expectations(recover_within_s=900, recover_slo_s=420))
+
+    def inject(self, ctx: Context) -> None:
+        ctx.kube.apply([{
+            "apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
+            "metadata": {"name": "chaos-local-path-2"},
+            "provisioner": "rancher.io/local-path",
+            "volumeBindingMode": "WaitForFirstConsumer", "reclaimPolicy": "Delete",
+        }])
+        ctx.reapply(ctx.spec.copy(storage_class="chaos-local-path-2"))
+        # Some operators apply this without touching a pod; give them time to act either way.
+        wait_until(lambda: ctx.op.ready_servers(ctx.spec) < ctx.spec.hosts, timeout=120, interval=2)
+
+    def verify(self, ctx: Context) -> None:
+        _blast_radius(ctx, ctx.samples, "the storage class changed")

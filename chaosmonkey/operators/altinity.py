@@ -111,6 +111,8 @@ class AltinityOperator(OperatorAdapter):
         if spec.prestop_sleep:
             c["lifecycle"] = {"preStop": {"exec": {"command": ["sleep", str(spec.prestop_sleep)]}}}
         pod: dict = {"containers": [c]}
+        if spec.node_selector:
+            pod["nodeSelector"] = dict(spec.node_selector)
         if spec.termination_grace is not None:
             pod["terminationGracePeriodSeconds"] = spec.termination_grace
         if spec.init_sleep:

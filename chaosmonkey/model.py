@@ -26,6 +26,7 @@ class ClusterSpec:
     prestop_sleep: int = 0
     termination_grace: int | None = None
     init_sleep: int = 0
+    node_selector: dict[str, str] = field(default_factory=dict)
     server_memory_limit: str = "1Gi"
     # Switching this to "b" changes the data volume claim template, which is immutable on a
     # StatefulSet, so it forces the operator down its delete-and-recreate path.
