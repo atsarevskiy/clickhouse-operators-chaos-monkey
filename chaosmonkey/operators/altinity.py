@@ -95,13 +95,15 @@ class AltinityOperator(OperatorAdapter):
         return f"{spec.name}-keeper"
 
     def _volume_templates(self, spec: ClusterSpec) -> list[dict]:
-        def vct(name: str, storage_class: str | None) -> dict:
-            s = {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": spec.storage}}}
-            if storage_class:
-                s["storageClassName"] = storage_class
-            return {"name": name, "spec": s}
-        return [vct("data-a", spec.storage_class),
-                vct("data-b", spec.volume_b_storage_class or spec.storage_class)]
+        """Only the template in use. An unused volumeClaimTemplate makes the Keeper controller
+        reconcile without ever settling (reproduced on 0.27.4), so declaring a spare would break
+        every scenario. A scenario forces a recreate by changing volume_variant, which renames the
+        template and so changes the StatefulSet's immutable volumeClaimTemplates."""
+        sc = spec.volume_b_storage_class if spec.volume_variant == "b" else spec.storage_class
+        s: dict = {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": spec.storage}}}
+        if sc:
+            s["storageClassName"] = sc
+        return [{"name": f"data-{spec.volume_variant}", "spec": s}]
 
     def _pod_spec(self, spec: ClusterSpec, container: str, image: str, memory: str) -> dict:
         c: dict = {"name": container, "image": image,
@@ -118,7 +120,9 @@ class AltinityOperator(OperatorAdapter):
 
     def render(self, spec: ClusterSpec) -> list[dict]:
         keeper = self._keeper_name(spec)
-        meta = {"labels": spec.pod_labels, "annotations": spec.pod_annotations}
+        # Only non-empty maps: an empty labels/annotations map on a pod template is normalized away
+        # and re-diffed on every pass, which makes the controller reconcile without ever settling.
+        meta = {k: v for k, v in (("labels", spec.pod_labels), ("annotations", spec.pod_annotations)) if v}
         chk = {
             "apiVersion": f"{CHK_GROUP}/v1", "kind": "ClickHouseKeeperInstallation",
             "metadata": {"name": keeper, "namespace": spec.namespace},
@@ -130,7 +134,7 @@ class AltinityOperator(OperatorAdapter):
                     "settings": {"keeper_server/four_letter_word_white_list": "*", **spec.keeper_settings},
                 },
                 "templates": {
-                    "podTemplates": [{"name": "keeper", "metadata": meta,
+                    "podTemplates": [{"name": "keeper", **({"metadata": meta} if meta else {}),
                                       "spec": self._pod_spec(spec, self.keeper_container, spec.keeper_image, "512Mi")}],
                     "volumeClaimTemplates": self._volume_templates(spec),
                 },
@@ -155,7 +159,7 @@ class AltinityOperator(OperatorAdapter):
                                                               "replicasCount": spec.replicas}}],
                 },
                 "templates": {
-                    "podTemplates": [{"name": "server", "metadata": meta,
+                    "podTemplates": [{"name": "server", **({"metadata": meta} if meta else {}),
                                       "spec": self._pod_spec(spec, self.server_container, spec.server_image,
                                                              spec.server_memory_limit)}],
                     "volumeClaimTemplates": self._volume_templates(spec),

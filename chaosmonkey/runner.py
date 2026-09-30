@@ -69,6 +69,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                             related_issues=list(scenario.related_issues))
     spec = scenario.spec_for(base).copy(namespace=f"cm-{scenario.id}"[:63])
     started = time.time()
+    started_rfc = now_rfc3339()
     ctx: Context | None = None
     missing = scenario.requires - op.capabilities
     if missing:
@@ -126,10 +127,17 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                            f"every pod Ready but the operator still reports {op.state(spec).phase}")
             else:
                 result.measure("time_to_status_healthy_s", ctx.status_converged_at, "s")
-        early = [s for s in ctx.samples if s["reconciled"] and not ctx.healthy(s)]
-        if early:
-            result.measure("status_healthy_while_pods_down_s", 3 * len(early), "s",
+        lying = [s for s in ctx.samples if s["reconciled"] and not ctx.healthy(s)]
+        if lying:
+            seconds = 3 * len(lying)
+            result.measure("status_healthy_while_pods_down_s", seconds, "s",
                            "status reported healthy while pods were not Ready")
+            # A brief overlap is normal while the operator is still observing; a sustained one means
+            # the reported status cannot be trusted to decide whether a cluster is whole.
+            if seconds > 60:
+                worst = min(s["servers_ready"] for s in lying)
+                result.add("warn", "status truthfulness",
+                           f"reported reconciled for {seconds}s while only {worst}/{spec.hosts} servers were Ready")
 
         # data and writes after recovery
         if ctx.recovered_at is not None:
@@ -199,8 +207,18 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         result.duration_s = round(time.time() - started, 1)
         if ctx is not None:
             (out_dir / f"{scenario.id}.samples.json").write_text(json.dumps(ctx.samples, indent=1))
+        # Only this scenario's window, and split per custom resource: one controller's reconcile
+        # loop can otherwise bury the lines that explain the scenario.
         try:
-            (out_dir / f"{scenario.id}.operator.log").write_text(op.operator_logs(since_time=None)[-2_000_000:])
+            log = op.operator_logs(since_time=started_rfc)
+            (out_dir / f"{scenario.id}.operator.log").write_text(log[-4_000_000:])
+            lines = [ln for ln in log.splitlines() if spec.namespace in ln]
+            (out_dir / f"{scenario.id}.operator.namespace.log").write_text("\n".join(lines)[-4_000_000:])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            (out_dir / f"{scenario.id}.events.txt").write_text(
+                op.kube.run("get", "events", "-n", spec.namespace, "--sort-by=.lastTimestamp", check=False))
         except Exception:  # noqa: BLE001
             pass
         restore_infrastructure(op, cluster)
