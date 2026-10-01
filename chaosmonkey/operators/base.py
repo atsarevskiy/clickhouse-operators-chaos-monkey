@@ -127,6 +127,8 @@ class OperatorAdapter(abc.ABC):
     #: and a new replica gets them from the operator. Replicated: DDL runs once and the database
     #: engine carries it to every replica.
     workload_database_engine: str = "Atomic"
+    #: the operator documents that deleting a cluster keeps its volumes, so leftover PVCs are policy
+    keeps_pvcs_on_delete: bool = False
     #: credentials the adapter provisions for the test workload
     workload_user: str = "chaos"
     workload_password: str = "chaos"

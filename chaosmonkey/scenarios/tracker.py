@@ -355,7 +355,11 @@ class DeletionWithoutOperator(Scenario):
         for kind in ("statefulsets", "services", "configmaps", "pvc"):
             left = [o["metadata"]["name"] for o in ctx.kube.items(kind, ctx.spec.namespace)
                     if not o["metadata"]["name"].startswith("kube-root-ca")]
-            if left:
+            if not left:
+                continue
+            if kind == "pvc" and ctx.op.keeps_pvcs_on_delete:
+                ctx.result.add("info", "retained volumes", f"PVCs kept, as the operator documents: {', '.join(sorted(left)[:6])}")
+            else:
                 ctx.result.add("warn", "orphaned objects", f"{kind} left behind: {', '.join(sorted(left)[:6])}")
 
 

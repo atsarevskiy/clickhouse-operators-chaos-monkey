@@ -59,6 +59,8 @@ class ClickHouseOperator(OperatorAdapter):
     # This operator creates and syncs schema for Replicated databases on new replicas; a plain
     # Atomic database is left to the user, so the workload uses the engine the operator manages.
     workload_database_engine = "Replicated('/clickhouse/databases/chaos', '{shard}', '{replica}')"
+    # docs/guides/introduction.mdx: "PVCs are **not** deleted automatically on cluster deletion"
+    keeps_pvcs_on_delete = True
 
     @property
     def tag(self) -> str:
