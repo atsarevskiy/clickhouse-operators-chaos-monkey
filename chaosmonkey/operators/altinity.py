@@ -120,6 +120,13 @@ class AltinityOperator(OperatorAdapter):
                                       "command": ["sleep", str(spec.init_sleep)]}]
         return pod
 
+    @staticmethod
+    def _distribution(spec: ClusterSpec) -> dict:
+        """ShardAntiAffinity: hosts of one shard (one Keeper ensemble) on different nodes."""
+        if not spec.spread_replicas:
+            return {}
+        return {"podDistribution": [{"type": "ShardAntiAffinity", "topologyKey": "kubernetes.io/hostname"}]}
+
     def render(self, spec: ClusterSpec) -> list[dict]:
         keeper = self._keeper_name(spec)
         # Only non-empty maps: an empty labels/annotations map on a pod template is normalized away
@@ -137,6 +144,7 @@ class AltinityOperator(OperatorAdapter):
                 },
                 "templates": {
                     "podTemplates": [{"name": "keeper", **({"metadata": meta} if meta else {}),
+                                      **self._distribution(spec),
                                       "spec": self._pod_spec(spec, self.keeper_container, spec.keeper_image, "512Mi")}],
                     "volumeClaimTemplates": self._volume_templates(spec),
                 },
@@ -162,6 +170,7 @@ class AltinityOperator(OperatorAdapter):
                 },
                 "templates": {
                     "podTemplates": [{"name": "server", **({"metadata": meta} if meta else {}),
+                                      **self._distribution(spec),
                                       "spec": self._pod_spec(spec, self.server_container, spec.server_image,
                                                              spec.server_memory_limit)}],
                     "volumeClaimTemplates": self._volume_templates(spec),

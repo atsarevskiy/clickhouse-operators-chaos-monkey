@@ -141,7 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--profile", default="smoke", choices=sorted(scenarios.PROFILES))
         sp.add_argument("--scenario", action="append", help="run only these scenario ids (repeatable)")
         sp.add_argument("--cluster", default="chaosmonkey", help="k3d cluster name")
-        sp.add_argument("--agents", type=int, default=1, help="k3d agent nodes besides the server")
+        sp.add_argument("--agents", type=int, default=2,
+                        help="k3d agent nodes besides the server; 2 gives three nodes, so three replicas of a shard can spread")
         sp.add_argument("--shards", type=int, default=2)
         sp.add_argument("--replicas", type=int, default=2)
         sp.add_argument("--keepers", type=int, default=3)

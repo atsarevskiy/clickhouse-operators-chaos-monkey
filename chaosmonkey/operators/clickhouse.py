@@ -121,6 +121,9 @@ class ClickHouseOperator(OperatorAdapter):
 
     def _pod_template(self, spec: ClusterSpec, image: str) -> dict:
         pt: dict = {}
+        if spec.spread_replicas:
+            # replicas of one shard, and the Keeper members, balanced across nodes
+            pt["topologyZoneKey"] = "kubernetes.io/hostname"
         if spec.node_selector:
             pt["nodeSelector"] = dict(spec.node_selector)
         if spec.termination_grace is not None:

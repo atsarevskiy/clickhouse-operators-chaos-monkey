@@ -27,6 +27,10 @@ class ClusterSpec:
     termination_grace: int | None = None
     init_sleep: int = 0
     node_selector: dict[str, str] = field(default_factory=dict)
+    # Ask the operator, through its own placement setting, to put replicas of one shard and the
+    # Keeper members on different nodes. Without it the scheduler may stack a whole shard on one
+    # node, and a node fault then measures where pods happened to land.
+    spread_replicas: bool = True
     server_memory_limit: str = "1Gi"
     # Switching this to "b" changes the data volume claim template, which is immutable on a
     # StatefulSet, so it forces the operator down its delete-and-recreate path.
