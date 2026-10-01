@@ -228,6 +228,9 @@ def _happened(r: dict) -> str:
     ro, wo = _value(r, "longest_read_outage_s"), _value(r, "longest_write_outage_s")
     if (ro is not None or wo is not None) and "availability" not in {f["check"] for f in r.get("findings", [])}:
         parts.append(f"longest outage read {ro if ro is not None else '-'} s / write {wo if wo is not None else '-'} s")
+    ro_wait = _value(r, "replica_readonly_after_healthy_s")
+    if ro_wait:
+        parts.append(f"a replica's tables stayed read-only {ro_wait:.0f} s after its pod was Ready")
     acked, lost = _value(r, "stream_batches_acked_total"), _value(r, "stream_acked_batches_lost")
     if acked:
         parts.append(f"{lost or 0} of {acked} acknowledged batches lost")

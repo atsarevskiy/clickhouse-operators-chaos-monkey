@@ -37,6 +37,8 @@ class Workload:
         self.next_id = 0
         #: what extra rows mean; a scenario that removes and re-adds a shard calls it resurrection
         self.surplus_label = "data duplication"
+        #: per replica, seconds its tables stayed read-only after the cluster was healthy
+        self.readonly_wait_s: dict[str, int] = {}
 
     # ---------- data ----------
 
@@ -133,14 +135,25 @@ class Workload:
     def _sync(self, name: str, table: str, timeout: int) -> str | None:
         """SYSTEM SYNC REPLICA; None once the replica has caught up, else why it has not. A replica
         that cannot sync still has its rows on a peer, so a short count is lag, not loss."""
+        db, tbl = table.split(".")
+        state_q = (f"SELECT is_readonly, is_session_expired, queue_size, last_queue_update_exception "
+                   f"FROM system.replicas WHERE database = '{db}' AND table = '{tbl}' FORMAT TSKV")
+        # A table that started while Keeper was unreachable stays read-only until ClickHouse's own
+        # restart thread retries, about a minute after Keeper is back, even with the pod Ready.
+        # Wait that out and record it, so the window is measured instead of judged as lag.
+        start = time.time()
+        while time.time() - start < timeout:
+            _, state = self.op.sql(self.spec, name, state_q)
+            if "is_readonly=1" not in state:
+                break
+            time.sleep(2)
+        if time.time() - start >= 2:
+            self.readonly_wait_s[name] = max(self.readonly_wait_s.get(name, 0), round(time.time() - start))
         rc, out = self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {table}", timeout=timeout)
         if rc == 0:
             return None
-        db, tbl = table.split(".")
-        _, state = self.op.sql(self.spec, name,
-                               f"SELECT is_readonly, is_session_expired, queue_size, last_queue_update_exception "
-                               f"FROM system.replicas WHERE database = '{db}' AND table = '{tbl}' FORMAT TSKV")
-        return f"SYNC REPLICA failed ({out.strip()[:120]}); {state.strip()[:200]}"
+        _, state = self.op.sql(self.spec, name, state_q)
+        return f"SYNC REPLICA failed ({' '.join(out.split())[-160:]}); {' '.join(state.split())[:200]}"
 
     def verify(self, sync_timeout: int = 120) -> list[Finding]:
         """Every replica of every shard must hold exactly the rows written to that shard."""

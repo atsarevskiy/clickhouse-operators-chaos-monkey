@@ -211,6 +211,11 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                 for f in stream_findings:
                     f.severity = "warn" if f.severity == "fail" else f.severity
             result.findings.extend(stream_findings)
+        if workload.readonly_wait_s:
+            # pods Ready while replicated tables still refuse writes: clients see a healthy cluster
+            # that fails inserts on those replicas
+            result.measure("replica_readonly_after_healthy_s", max(workload.readonly_wait_s.values()), "s",
+                           ", ".join(f"{k} {v}s" for k, v in sorted(workload.readonly_wait_s.items())))
         quorum = workload.keeper_quorum(ctx.t_inject, t_end)
         result.measure("keeper_min_serving", quorum["min_serving"], "members")
         result.measure("keeper_longest_below_quorum_s", quorum["longest_below_quorum_s"], "s")
