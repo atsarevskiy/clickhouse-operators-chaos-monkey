@@ -189,6 +189,7 @@ _PLAIN = {
     "orphaned objects": "left objects behind after deletion",
     "stale data resurrected on re-added shard": "old data came back with a re-added shard",
     "keeper leadership": "Keeper had no leader for too long",
+    "container OOM": "a container was killed at its memory limit",
     "shard re-added": "a re-added shard did not work",
 }
 
@@ -371,7 +372,7 @@ def readme_table(results: list[dict]) -> str:
              "`failures` are the scenarios that break something, `changes` the spec and performance ones. "
              "`Never healthy` counts runs with no time at all, which the percentiles leave out. Client outage "
              "is the longest run of failed reads or writes during the run. INVALID runs happened while the host "
-             "was overloaded (OOM kills, load above 2 per CPU, or under 3 GB free) and are not scored. "
+             "was overloaded (load above 2 per CPU, or under 3 GB free) and are not scored. "
              "PASS/DEGRADED/FAIL/SKIPPED/INVALID count runs.", "",
              "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for s in order:

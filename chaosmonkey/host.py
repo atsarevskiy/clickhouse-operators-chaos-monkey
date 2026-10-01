@@ -4,6 +4,8 @@ Every k3d node shares one host. When the host runs out of CPU or memory, API cal
 probes fail and the kernel kills containers, and a scenario then measures the host instead of
 the operator. One sampler per process records load, available memory and the kernel's OOM kill
 counter; the runner checks a scenario's window against it and refuses to score an overloaded one.
+The OOM counter also counts a container killed at its own memory limit, which is a property of
+the scenario rather than of the host, so it is recorded but only load and free memory decide.
 """
 
 from __future__ import annotations
@@ -58,8 +60,6 @@ class HostMonitor:
         """Why the window can't be scored, or None if the host kept up."""
         w = self.window(start, end)
         reasons = []
-        if w.get("oom_kills"):
-            reasons.append(f"the kernel OOM-killed {w['oom_kills']} processes")
         if w.get("max_load_per_cpu", 0) > MAX_LOAD_PER_CPU:
             reasons.append(f"load reached {w['max_load_per_cpu']:.1f} per CPU")
         if w.get("min_available_gb", 99) < MIN_AVAILABLE_GB:

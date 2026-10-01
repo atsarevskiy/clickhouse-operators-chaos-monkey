@@ -31,7 +31,7 @@ class ClusterSpec:
     # Keeper members on different nodes. Without it the scheduler may stack a whole shard on one
     # node, and a node fault then measures where pods happened to land.
     spread_replicas: bool = True
-    server_memory_limit: str = "1Gi"
+    server_memory_limit: str = "2Gi"
     # Switching this to "b" changes the data volume claim template, which is immutable on a
     # StatefulSet, so it forces the operator down its delete-and-recreate path.
     volume_variant: str = "a"

@@ -227,6 +227,16 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         if exp.keeper_quorum_must_hold and quorum["longest_below_quorum_s"] > 10:
             result.add("fail", "keeper quorum", f"below quorum for {quorum['longest_below_quorum_s']}s")
 
+        # a container killed at its memory limit changes what the scenario measured
+        oom = []
+        for pod in op.kube.items("pods", spec.namespace):
+            for cs in pod["status"].get("containerStatuses") or []:
+                last = (cs.get("lastState") or {}).get("terminated") or {}
+                if last.get("reason") == "OOMKilled":
+                    oom.append(f"{pod['metadata']['name']}/{cs['name']} ({cs.get('restartCount', 0)} restarts)")
+        if oom:
+            result.add("warn", "container OOM", f"killed at its memory limit during the scenario: {', '.join(oom)}")
+
         # operator-specific checks: a reconcile the scenario triggered may still be finishing, so
         # only findings still present after a second look count
         first = op.verify_operator_state(spec)
