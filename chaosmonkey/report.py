@@ -250,28 +250,97 @@ def _expected(scenario_id: str) -> str:
     return s.description + (" Targets: " + ", ".join(targets) + "." if targets else "")
 
 
+#: findings about speed rather than about a wrong outcome; the timing tables cover them, so they
+#: don't lower the correctness score
+PERFORMANCE_CHECKS = {"availability", "recovery time", "keeper leadership"}
+
+#: categories where the operator reacts to something breaking; the rest are changes it applies
+CHANGE_CATEGORIES = {"spec", "performance"}
+
+
+def correctness_score(r: dict) -> float | None:
+    """100 with no correctness finding, 50 with warnings only, 0 with any failure."""
+    if r["verdict"] not in POINTS:
+        return None
+    sev = {f["severity"] for f in r.get("findings", []) if f["check"] not in PERFORMANCE_CHECKS}
+    return 0.0 if "fail" in sev else 50.0 if "warn" in sev else 100.0
+
+
+def _mean(xs: list) -> float | None:
+    xs = [x for x in xs if x is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _pct(xs: list[float], q: float) -> float | None:
+    """Nearest-rank percentile."""
+    if not xs:
+        return None
+    xs = sorted(xs)
+    return xs[min(len(xs) - 1, max(0, int(round(q * len(xs) + 0.5)) - 1))]
+
+
+def _per_scenario(rs: list[dict], fn) -> dict[str, tuple[str, float]]:
+    """A scenario run several times scores the average of its runs, and counts once."""
+    runs: dict[str, list[dict]] = defaultdict(list)
+    for r in rs:
+        runs[_base(r["scenario"])].append(r)
+    out = {}
+    for sid, rr in runs.items():
+        v = _mean([fn(r) for r in rr])
+        if v is not None:
+            out[sid] = (rr[0]["category"], v)
+    return out
+
+
+def _fmt(v: float | None) -> str:
+    return "-" if v is None else f"{v:.0f}"
+
+
+def _timing_row(label: str, rs: list[dict]) -> list[str]:
+    """Every run is one event: its time to healthy, plus how many runs never got there."""
+    ran = [r for r in rs if r["verdict"] in POINTS]
+    times = [v for r in ran if (v := _value(r, "time_to_recover_s")) is not None]
+    outages = [max(x for x in (_value(r, "longest_read_outage_s"), _value(r, "longest_write_outage_s")) if x is not None)
+               for r in ran if _value(r, "longest_read_outage_s") is not None or _value(r, "longest_write_outage_s") is not None]
+    return [label, str(len(times)), _fmt(_mean(times)), _fmt(_pct(times, 0.5)), _fmt(_pct(times, 0.9)),
+            _fmt(_pct(times, 0.99)), _fmt(max(times) if times else None), str(len(ran) - len(times)),
+            _fmt(_mean(outages)), _fmt(_pct(outages, 0.9)), _fmt(max(outages) if outages else None)]
+
+
 def summary_table(results: list[dict]) -> str:
     targets = sorted({(r["operator"], r["version"]) for r in results})
-    cats = sorted({r["category"] for r in results if r["category"] != "performance"})
-    head = ["Operator", "Score", "PASS", "DEGRADED", "FAIL", "SKIPPED"] + cats
+    cats = sorted({r["category"] for r in results})
+    head = ["Operator", "Correctness", "PASS", "DEGRADED", "FAIL", "SKIPPED"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    per_target = {}
     for t in targets:
-        rs = [r for r in results if (r["operator"], r["version"]) == t and r["category"] != "performance"]
-        # a scenario run several times scores the average of its runs, and counts once
-        runs: dict[str, list[dict]] = defaultdict(list)
-        for r in rs:
-            runs[_base(r["scenario"])].append(r)
-        scored = {sid: (rr[0]["category"], sum(POINTS[r["verdict"]] for r in rr if r["verdict"] in POINTS)
-                        / len([r for r in rr if r["verdict"] in POINTS]))
-                  for sid, rr in runs.items() if any(r["verdict"] in POINTS for r in rr)}
+        rs = [r for r in results if (r["operator"], r["version"]) == t]
+        cor = _per_scenario(rs, correctness_score)
+        per_target[t] = cor
         c = defaultdict(int)
         for r in rs:
             c[r["verdict"]] += 1
-        row = [f"{t[0]} {t[1]}", f"**{sum(v for _, v in scored.values()) / len(scored):.0f}/100**" if scored else "-",
-               str(c["PASS"]), str(c["DEGRADED"]), str(c["FAIL"]), str(c["SKIPPED"])]
-        for cat in cats:
-            cr = [v for k, v in scored.values() if k == cat]
-            row.append(f"{sum(cr) / len(cr):.0f}" if cr else "-")
+        lines.append("| " + " | ".join([
+            f"{t[0]} {t[1]}", f"**{_fmt(_mean([v for _, v in cor.values()]))}/100**",
+            str(c["PASS"]), str(c["DEGRADED"]), str(c["FAIL"]), str(c["SKIPPED"])]) + " |")
+    head = ["Operator", "Events", "Runs timed", "Mean s", "p50 s", "p90 s", "p99 s", "Max s", "Never healthy",
+            "Client outage mean s", "Outage p90 s", "Outage max s"]
+    lines += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for t in targets:
+        rs = [r for r in results if (r["operator"], r["version"]) == t]
+        for label, group in (("failures", [r for r in rs if r["category"] not in CHANGE_CATEGORIES]),
+                             ("changes", [r for r in rs if r["category"] in CHANGE_CATEGORIES])):
+            lines.append("| " + " | ".join([f"{t[0]} {t[1]}"] + _timing_row(label, group)) + " |")
+    lines += ["", "| Category | " + " | ".join(f"{o} correctness / p50 / p90 s" for o, _ in targets) + " |",
+              "|---|" + "---|" * len(targets)]
+    for cat in cats:
+        row = [cat]
+        for t in targets:
+            cor = per_target[t]
+            times = [v for r in results if (r["operator"], r["version"]) == t and r["category"] == cat
+                     and r["verdict"] in POINTS and (v := _value(r, "time_to_recover_s")) is not None]
+            row.append(f"{_fmt(_mean([v for k, v in cor.values() if k == cat]))} / "
+                       f"{_fmt(_pct(times, 0.5))} / {_fmt(_pct(times, 0.9))}")
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
 
@@ -289,9 +358,14 @@ def readme_table(results: list[dict]) -> str:
     for o, v in targets:
         head += [f"{o} {v}", f"What happened ({o})"]
     lines = [summary_table(results), "",
-             "Score per scenario: PASS 100, DEGRADED 50, FAIL 0; the operator score averages the resilience "
-             "scenarios it ran (performance and SKIPPED excluded), a repeated scenario counting once with the "
-             "average of its runs. PASS/DEGRADED/FAIL/SKIPPED count runs.", "",
+             "**Correctness** asks whether the outcome was right: data kept, every host back, status honest, "
+             "nothing destroyed. Per scenario it is 100 with no correctness finding, 50 with warnings only, 0 with "
+             "a failure; a scenario run several times counts once with the average of its runs, and SKIPPED "
+             "scenarios don't count. **Response time** is seconds from the fault ending (or the change being "
+             "applied) until every pod is Ready and the change has reached every pod, one sample per run: "
+             "`failures` are the scenarios that break something, `changes` the spec and performance ones. "
+             "`Never healthy` counts runs with no time at all, which the percentiles leave out. Client outage "
+             "is the longest run of failed reads or writes during the run. PASS/DEGRADED/FAIL/SKIPPED count runs.", "",
              "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for s in order:
         runs = [index.get((o, v, s), []) for o, v in targets]
@@ -308,6 +382,9 @@ def readme_table(results: list[dict]) -> str:
             text = _happened(worst) or "recovered cleanly"
             if len(rr) > 1:
                 text = f"{len(rr)} runs; worst: " + text
-            row += [verdicts, text]
+            took = [v for r in rr if (v := _value(r, "time_to_recover_s")) is not None]
+            scores = (f"correctness {_fmt(_mean([correctness_score(r) for r in rr]))}, "
+                      + (f"healthy in {' / '.join(_fmt(x) for x in took)} s" if took else "never healthy"))
+            row += [verdicts if rr[0]["verdict"] == "SKIPPED" else f"{verdicts}<br>{scores}", text]
         lines.append("| " + " | ".join(c.replace("|", "/") for c in row) + " |")
     return "\n".join(lines)
