@@ -130,6 +130,18 @@ class Workload:
             self.expected[shard] = self.expected.get(shard, 0) + rows_per_shard
         return findings
 
+    def _sync(self, name: str, table: str, timeout: int) -> str | None:
+        """SYSTEM SYNC REPLICA; None once the replica has caught up, else why it has not. A replica
+        that cannot sync still has its rows on a peer, so a short count is lag, not loss."""
+        rc, out = self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {table}", timeout=timeout)
+        if rc == 0:
+            return None
+        db, tbl = table.split(".")
+        _, state = self.op.sql(self.spec, name,
+                               f"SELECT is_readonly, is_session_expired, queue_size, last_queue_update_exception "
+                               f"FROM system.replicas WHERE database = '{db}' AND table = '{tbl}' FORMAT TSKV")
+        return f"SYNC REPLICA failed ({out.strip()[:120]}); {state.strip()[:200]}"
+
     def verify(self, sync_timeout: int = 120) -> list[Finding]:
         """Every replica of every shard must hold exactly the rows written to that shard."""
         findings = []
@@ -139,14 +151,17 @@ class Workload:
                 if not pod_ready(pod):
                     findings.append(Finding("fail", "data", f"{name} not Ready, cannot verify its data"))
                     continue
-                self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {LOCAL}", timeout=sync_timeout)
+                unsynced = self._sync(name, LOCAL, sync_timeout)
                 rc, out = self.op.sql(self.spec, name, f"SELECT count() FROM {LOCAL}")
                 if rc != 0:
                     findings.append(Finding("fail", "data", f"{name}: count failed: {out.strip()[:200]}"))
                     continue
                 got = int(out.strip() or 0)
                 want = self.expected.get(shard, 0)
-                if got < want:
+                if got < want and unsynced:
+                    findings.append(Finding("fail", "replica not caught up",
+                                            f"{name} (shard {shard}) has {got} rows, expected {want}: {unsynced}"))
+                elif got < want:
                     findings.append(Finding("fail", "data loss", f"{name} (shard {shard}) has {got} rows, expected {want}"))
                 elif got > want:
                     findings.append(Finding("warn", self.surplus_label,
@@ -169,8 +184,10 @@ class Workload:
         )
         # One batch per second. A batch counts as acknowledged only when the client got success
         # from a synchronous distributed insert; the check afterwards looks each one up.
+        # The sequence number is the wall clock in milliseconds, so a writer that gets restarted
+        # (its node was stopped, say) can never reuse a number and fake a duplicate.
         stream_loop = (
-            "s=0; while true; do s=$((s+1)); "
+            f"while true; do s={ms}; "
             f"t0={ms}; if {client} --insert_distributed_sync 1 -q \"INSERT INTO {STREAM_DIST} (id, shard) "
             f"SELECT {STREAM_BASE} + $s * 1000 + number, $((s % {self.spec.shards})) FROM numbers({STREAM_BATCH})\" "
             f">/dev/null 2>&1; then a=ok; else a=fail; fi; t1={ms}; "
@@ -200,6 +217,10 @@ class Workload:
             "metadata": {"name": name, "labels": {"chaosmonkey": "probe"}},
             "spec": {
                 "terminationGracePeriodSeconds": 0,
+                # On the control plane, which no scenario stops or drains, so a probe measures the
+                # cluster instead of dying with the node under test.
+                "nodeSelector": {"node-role.kubernetes.io/control-plane": "true"},
+                "tolerations": [{"operator": "Exists"}],
                 "containers": [{"name": "probe", "image": image, "imagePullPolicy": "IfNotPresent",
                                 "command": ["sh", "-c", loop],
                                 "resources": {"requests": {"cpu": "20m", "memory": "32Mi"}}}],
@@ -282,12 +303,11 @@ class Workload:
         last = max(acked | failed, default=0)
         time.sleep(3)
         ready = [p["metadata"]["name"] for p in self.op.server_pods(self.spec) if pod_ready(p)]
-        for name in ready:
-            self.op.sql(self.spec, name, f"SYSTEM SYNC REPLICA {STREAM_LOCAL}", timeout=sync_timeout)
+        unsynced = {name: why for name in ready if (why := self._sync(name, STREAM_LOCAL, sync_timeout))}
         # per shard, per replica: count rows per batch on every replica so a replica that is
         # missing batches, or holds extras, is caught even if its peer is complete
         per_seq_best: dict[int, int] = {}
-        diverged = []
+        diverged, lagging = [], []
         for shard in range(self.spec.shards):
             counts_by_replica = []
             for pod in self.op.server_pods(self.spec, shard=shard):
@@ -309,14 +329,16 @@ class Workload:
                 ref_name, ref = counts_by_replica[0]
                 for name, c in counts_by_replica[1:]:
                     if c != ref:
-                        diverged.append(f"{name} vs {ref_name}")
+                        behind = [n for n in (name, ref_name) if n in unsynced]
+                        (lagging if behind else diverged).append(
+                            f"{name} vs {ref_name}" + (f" ({behind[0]}: {unsynced[behind[0]]})" if behind else ""))
         lost = sorted(s for s in acked if per_seq_best.get(s, 0) < STREAM_BATCH)
         dup = sorted(s for s, n in per_seq_best.items() if n > STREAM_BATCH)
         landed_despite_error = sorted(s for s in failed if per_seq_best.get(s, 0) >= STREAM_BATCH)
         stats = {"batches_acked_total": len(acked), "batches_failed_total": len(failed),
                  "acked_batches_lost": len(lost), "batches_duplicated": len(dup),
                  "failed_batches_stored_anyway": len(landed_despite_error),
-                 "replicas_diverged": len(diverged)}
+                 "replicas_diverged": len(diverged), "replicas_not_caught_up": len(lagging)}
         if lost:
             findings.append(Finding("fail", "acknowledged writes lost",
                                     f"{len(lost)} of {len(acked)} acknowledged batches missing or partial "
@@ -326,6 +348,9 @@ class Workload:
         if diverged:
             findings.append(Finding("fail", "replica divergence",
                                     f"replicas of the same shard hold different stream data: {', '.join(diverged[:4])}"))
+        if lagging:
+            findings.append(Finding("fail", "replica not caught up",
+                                    f"replicas of the same shard differ and could not sync: {'; '.join(lagging[:2])}"))
         return stats, findings
 
     def keeper_leaderless(self, since: float, until: float | None = None) -> dict:

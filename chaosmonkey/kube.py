@@ -104,7 +104,7 @@ class Kube:
         return self.run(*args, check=False, timeout=120)
 
 
-def wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 2.0) -> float | None:
+def wait_until(predicate: Callable[[], bool], timeout: float, interval: float = 1.0) -> float | None:
     """Poll until predicate() is true. Returns elapsed seconds, or None on timeout."""
     start = time.monotonic()
     while True:

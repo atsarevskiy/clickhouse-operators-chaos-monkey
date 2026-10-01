@@ -122,7 +122,7 @@ class VersionUpgrade(Scenario):
             pods = ctx.op.server_pods(ctx.spec)
             return len(pods) == ctx.spec.hosts and all(
                 pod_ready(p) and p["spec"]["containers"][0]["image"].endswith(self.to_image.split("/")[-1]) for p in pods)
-        t = wait_until(upgraded, timeout=ctx.result_expect().recover_within_s, interval=3)
+        t = wait_until(upgraded, timeout=ctx.result_expect().recover_within_s, interval=1)
         ctx.result.measure("upgrade_completed_after_s", t, "s")
         if t is None:
             ctx.result.add("fail", "upgrade", "not every host is on the new version")
@@ -144,11 +144,17 @@ class InvalidSpecRejected(Scenario):
         self.good = ctx.spec
         ctx.notes["sts_before"] = self._sts(ctx)
         ctx.reapply(ctx.spec.copy(pod_labels={**ctx.spec.pod_labels, "chaosmonkey-bad": "/metrics"}))
-        end, lowest = time.time() + self.observe_s, len(ctx.notes["sts_before"])
-        while time.time() < end:
+        start, lowest = time.time(), len(ctx.notes["sts_before"])
+        last_sig, last_change = None, time.time()
+        while time.time() - start < self.observe_s:
             ctx.snapshot()
             lowest = min(lowest, len(self._sts(ctx)))
-            time.sleep(3)
+            sig = ctx.progress_signature()
+            if sig != last_sig:
+                last_sig, last_change = sig, time.time()
+            elif time.time() - start >= 30 and time.time() - last_change >= 45:
+                break
+            time.sleep(1)
         ctx.notes["sts_lowest"] = lowest
         ctx.notes["bad_phase_samples"] = list(ctx.samples)
 
@@ -218,10 +224,7 @@ class UnschedulableReplacement(Scenario):
     def inject(self, ctx: Context) -> None:
         self.good = ctx.spec
         ctx.reapply(ctx.spec.copy(volume_variant="b", volume_b_storage_class="does-not-exist"))
-        end = time.time() + self.observe_s
-        while time.time() < end:
-            ctx.snapshot()
-            time.sleep(3)
+        ctx.observe(self.observe_s)
         ctx.notes["bad_phase_samples"] = list(ctx.samples)
         ctx.notes["bad_phase_end"] = time.time()
 

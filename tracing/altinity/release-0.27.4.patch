@@ -1,0 +1,772 @@
+diff --git a/pkg/apis/clickhouse.altinity.com/v1/action_plan.go b/pkg/apis/clickhouse.altinity.com/v1/action_plan.go
+index 4a73cfa0..f6fa5e91 100644
+--- a/pkg/apis/clickhouse.altinity.com/v1/action_plan.go
++++ b/pkg/apis/clickhouse.altinity.com/v1/action_plan.go
+@@ -16,6 +16,8 @@ package v1
+ 
+ import (
+ 	"fmt"
++	"sort"
++	"strings"
+ 	"sync"
+ 
+ 	"gopkg.in/d4l3k/messagediff.v1"
+@@ -242,6 +244,37 @@ func (ap *ActionPlan) HasActionsToDo() bool {
+ 	return !ap.deletionTimestampEqual || !ap.finalizersEqual || !ap.attributesEqual
+ }
+ 
++// TraceActionPlan renders a one-line summary of which parts of an action plan differ, with at most
++// a few spec paths, cheap enough for a per-event log line.
++func TraceActionPlan(plan IActionPlan) string {
++	ap, ok := plan.(*ActionPlan)
++	if !ok || ap == nil {
++		return "ap=none"
++	}
++	paths := func(d *messagediff.Diff) (added, removed, modified int, sample string) {
++		if d == nil {
++			return 0, 0, 0, ""
++		}
++		var all []string
++		for _, items := range []map[*messagediff.Path]interface{}{d.Added, d.Removed, d.Modified} {
++			for p := range items {
++				all = append(all, util.PrintPath(p, ""))
++			}
++		}
++		sort.Strings(all)
++		if len(all) > 5 {
++			all = append(all[:5], "...")
++		}
++		return len(d.Added), len(d.Removed), len(d.Modified), strings.Join(all, ",")
++	}
++	sa, sr, sm, sp := paths(ap.specDiff)
++	la, lr, lm, _ := paths(ap.labelsDiff)
++	return fmt.Sprintf(
++		"specEqual=%t specAdded=%d specRemoved=%d specModified=%d specPaths=[%s] labelsEqual=%t labelsChanged=%d deletionTimestampEqual=%t finalizersEqual=%t attributesEqual=%t",
++		ap.specEqual, sa, sr, sm, sp, ap.labelsEqual, la+lr+lm, ap.deletionTimestampEqual, ap.finalizersEqual, ap.attributesEqual,
++	)
++}
++
+ func (ap *ActionPlan) Log(tag string) string {
+ 	return fmt.Sprintf(
+ 		"\nActionPlan start %s ---------------------------------------------:\n%s\nActionPlan end %s ---------------------------------------------",
+diff --git a/pkg/controller/chi/controller.go b/pkg/controller/chi/controller.go
+index 736fad9b..17018f62 100644
+--- a/pkg/controller/chi/controller.go
++++ b/pkg/controller/chi/controller.go
+@@ -276,6 +276,7 @@ func (c *Controller) addEventHandlersService(
+ 				return
+ 			}
+ 			log.V(3).M(service).Info("serviceInformer.AddFunc")
++			traceOwnedObjectEvent("svc", "add", service, false)
+ 		},
+ 		UpdateFunc: func(old, new interface{}) {
+ 			oldService := old.(*core.Service)
+@@ -283,12 +284,16 @@ func (c *Controller) addEventHandlersService(
+ 				return
+ 			}
+ 			log.V(3).M(oldService).Info("serviceInformer.UpdateFunc")
++			if newService := new.(*core.Service); newService.GetResourceVersion() != oldService.GetResourceVersion() {
++				traceOwnedObjectEvent("svc", "update", newService, false)
++			}
+ 		},
+ 		DeleteFunc: deleteHandler("serviceInformer.DeleteFunc", func(service *core.Service) {
+ 			if !c.isTrackedObject(&service.ObjectMeta) {
+ 				return
+ 			}
+ 			log.V(3).M(service).Info("serviceInformer.DeleteFunc")
++			traceOwnedObjectEvent("svc", "delete", service, false)
+ 		}),
+ 	})
+ }
+@@ -468,6 +473,7 @@ func (c *Controller) addEventHandlersConfigMap(
+ 				return
+ 			}
+ 			log.V(3).M(configMap).Info("configMapInformer.AddFunc")
++			traceOwnedObjectEvent("cm", "add", configMap, false)
+ 		},
+ 		UpdateFunc: func(old, new interface{}) {
+ 			configMap := old.(*core.ConfigMap)
+@@ -475,12 +481,16 @@ func (c *Controller) addEventHandlersConfigMap(
+ 				return
+ 			}
+ 			log.V(3).M(configMap).Info("configMapInformer.UpdateFunc")
++			if newConfigMap := new.(*core.ConfigMap); newConfigMap.GetResourceVersion() != configMap.GetResourceVersion() {
++				traceOwnedObjectEvent("cm", "update", newConfigMap, false)
++			}
+ 		},
+ 		DeleteFunc: deleteHandler("configMapInformer.DeleteFunc", func(configMap *core.ConfigMap) {
+ 			if !c.isTrackedObject(&configMap.ObjectMeta) {
+ 				return
+ 			}
+ 			log.V(3).M(configMap).Info("configMapInformer.DeleteFunc")
++			traceOwnedObjectEvent("cm", "delete", configMap, false)
+ 		}),
+ 	})
+ }
+@@ -495,6 +505,7 @@ func (c *Controller) addEventHandlersStatefulSet(
+ 				return
+ 			}
+ 			log.V(3).M(statefulSet).Info("statefulSetInformer.AddFunc")
++			traceOwnedObjectEvent("sts", "add", statefulSet, false)
+ 		},
+ 		UpdateFunc: func(old, new interface{}) {
+ 			statefulSet := old.(*apps.StatefulSet)
+@@ -502,16 +513,27 @@ func (c *Controller) addEventHandlersStatefulSet(
+ 				return
+ 			}
+ 			log.V(3).M(statefulSet).Info("statefulSetInformer.UpdateFunc")
++			if newStatefulSet := new.(*apps.StatefulSet); newStatefulSet.GetResourceVersion() != statefulSet.GetResourceVersion() {
++				traceOwnedObjectEvent("sts", "update", newStatefulSet, false)
++			}
+ 		},
+ 		DeleteFunc: deleteHandler("statefulSetInformer.DeleteFunc", func(statefulSet *apps.StatefulSet) {
+ 			if !c.isTrackedObject(&statefulSet.ObjectMeta) {
+ 				return
+ 			}
+ 			log.V(3).M(statefulSet).Info("statefulSetInformer.DeleteFunc")
++			traceOwnedObjectEvent("sts", "delete", statefulSet, false)
+ 		}),
+ 	})
+ }
+ 
++// traceOwnedObjectEvent records an informer event on an operator-generated object and whether
++// the handler put anything on the work queue for it.
++func traceOwnedObjectEvent(kind, event string, m meta.Object, enqueued bool) {
++	log.Info("CHAOSTRACE %s-informer-%s ns=%s name=%s rv=%s enqueued=%t",
++		kind, event, m.GetNamespace(), m.GetName(), m.GetResourceVersion(), enqueued)
++}
++
+ func (c *Controller) addEventHandlersPod(
+ 	kubeInformerFactory kubeInformers.SharedInformerFactory,
+ ) {
+@@ -522,6 +544,7 @@ func (c *Controller) addEventHandlersPod(
+ 				return
+ 			}
+ 			log.V(3).M(pod).Info("podInformer.AddFunc")
++			traceOwnedObjectEvent("pod", "add", pod, true)
+ 			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileAdd, nil, pod))
+ 		},
+ 		UpdateFunc: func(old, new interface{}) {
+@@ -531,6 +554,9 @@ func (c *Controller) addEventHandlersPod(
+ 				return
+ 			}
+ 			log.V(3).M(newPod).Info("podInformer.UpdateFunc")
++			if newPod.GetResourceVersion() != oldPod.GetResourceVersion() {
++				traceOwnedObjectEvent("pod", "update", newPod, true)
++			}
+ 			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileUpdate, oldPod, newPod))
+ 		},
+ 		DeleteFunc: deleteHandler("podInformer.DeleteFunc", func(pod *core.Pod) {
+@@ -538,6 +564,7 @@ func (c *Controller) addEventHandlersPod(
+ 				return
+ 			}
+ 			log.V(3).M(pod).Info("podInformer.DeleteFunc")
++			traceOwnedObjectEvent("pod", "delete", pod, true)
+ 			c.enqueueObject(cmd_queue.NewReconcilePod(cmd_queue.ReconcileDelete, pod, nil))
+ 		}),
+ 	})
+@@ -679,6 +706,11 @@ func prepareCHIAdd(command *cmd_queue.ReconcileCHI) bool {
+ 
+ func prepareCHIUpdate(command *cmd_queue.ReconcileCHI) bool {
+ 	actionPlan := api.MakeActionPlan(command.Old, command.New)
++	log.Info("CHAOSTRACE chi-update-actionplan ns=%s name=%s oldRV=%s newRV=%s oldGen=%d newGen=%d hasActionsToDo=%t %s",
++		command.New.GetNamespace(), command.New.GetName(),
++		command.Old.GetResourceVersion(), command.New.GetResourceVersion(),
++		command.Old.GetGeneration(), command.New.GetGeneration(),
++		actionPlan.HasActionsToDo(), api.TraceActionPlan(actionPlan))
+ 	if !actionPlan.HasActionsToDo() {
+ 		return false
+ 	}
+@@ -719,6 +751,17 @@ func logCommand(command *cmd_queue.ReconcileCHI) {
+ 	log.V(1).Info("ENQUEUE new ReconcileCHI cmd=%s for %s/%s", command.Cmd, namespace, name)
+ }
+ 
++func traceCHIEnqueue(command *cmd_queue.ReconcileCHI, enqueued bool) {
++	namespace, name := "", ""
++	switch {
++	case command.New != nil:
++		namespace, name = command.New.Namespace, command.New.Name
++	case command.Old != nil:
++		namespace, name = command.Old.Namespace, command.Old.Name
++	}
++	log.Info("CHAOSTRACE chi-enqueue cmd=%s ns=%s name=%s enqueued=%t", command.Cmd, namespace, name, enqueued)
++}
++
+ // enqueueObject adds ClickHouseInstallation object to the work queue
+ func (c *Controller) enqueueObject(obj queue.PriorityQueueItem) {
+ 	handle := []byte(obj.Handle().(string))
+@@ -734,6 +777,7 @@ func (c *Controller) enqueueObject(obj queue.PriorityQueueItem) {
+ 		case cmd_queue.ReconcileUpdate:
+ 			enqueue = prepareCHIUpdate(command)
+ 		}
++		traceCHIEnqueue(command, enqueue)
+ 	case
+ 		*cmd_queue.ReconcileCHIT,
+ 		*cmd_queue.ReconcileChopConfig,
+diff --git a/pkg/controller/chi/worker-deleter.go b/pkg/controller/chi/worker-deleter.go
+index 6f1edbcf..681881df 100644
+--- a/pkg/controller/chi/worker-deleter.go
++++ b/pkg/controller/chi/worker-deleter.go
+@@ -76,8 +76,10 @@ func (w *worker) dropZKReplicas(ctx context.Context, cr *api.ClickHouseInstallat
+ 		func(cluster api.ICluster) {
+ 		},
+ 		func(shard api.IShard) {
++			log.Info("CHAOSTRACE chi-drop-zk-replicas-shard-removed ns=%s chi=%s shard=%s action=none", cr.GetNamespace(), cr.GetName(), shard.GetName())
+ 		},
+ 		func(host *api.Host) {
++			log.Info("CHAOSTRACE chi-drop-zk-replicas-host-removed ns=%s chi=%s host=%s", cr.GetNamespace(), cr.GetName(), host.GetName())
+ 			_ = w.dropZKReplica(ctx, host, NewDropReplicaOptions().SetRegularDrop())
+ 			cnt++
+ 		},
+@@ -124,6 +126,7 @@ func (w *worker) purgeStatefulSet(
+ ) int {
+ 	if shouldPurgeStatefulSet(cr, reconcileFailedObjs, m) {
+ 		w.a.V(1).M(m).F().Info("Delete StatefulSet: %s", util.NamespaceNameString(m))
++		log.Info("CHAOSTRACE chi-purge-sts ns=%s name=%s", m.GetNamespace(), m.GetName())
+ 		if err := w.c.kube.STS().Delete(ctx, m.GetNamespace(), m.GetName()); err != nil {
+ 			w.a.V(1).M(m).F().Error("FAILED to delete StatefulSet: %s, err: %v", util.NamespaceNameString(m), err)
+ 		}
+@@ -479,10 +482,14 @@ func (w *worker) dropZKReplica(ctx context.Context, hostToDrop *api.Host, opts *
+ 
+ 	if !w.canDropReplica(ctx, hostToRunOn, hostToDrop, opts) {
+ 		w.a.V(1).F().Warning("CAN NOT drop replica. hostToDrop: %s", hostToDrop.GetName())
++		log.Info("CHAOSTRACE chi-drop-zk-replica hostToDrop=%s runOn=%s regular=%t storageLoss=%t allowed=false",
++			hostToDrop.GetName(), hostToRunOn.GetName(), opts.RegularDrop(), opts.ForceDropUponStorageLoss())
+ 		return nil
+ 	}
+ 
+ 	err := w.ensureClusterSchemer(hostToRunOn).HostDropReplica(ctx, hostToRunOn, hostToDrop)
++	log.Info("CHAOSTRACE chi-drop-zk-replica hostToDrop=%s runOn=%s regular=%t storageLoss=%t allowed=true err=%v",
++		hostToDrop.GetName(), hostToRunOn.GetName(), opts.RegularDrop(), opts.ForceDropUponStorageLoss(), err)
+ 
+ 	if err == nil {
+ 		w.a.V(1).
+@@ -508,9 +515,11 @@ func (w *worker) deleteTables(ctx context.Context, host *api.Host) error {
+ 	}
+ 
+ 	if !w.c.pvcDeleter.HostCanDeleteAllPVCs(host) {
++		log.Info("CHAOSTRACE chi-drop-tables host=%s canDeleteAllPVCs=false skipped=true", host.GetName())
+ 		return nil
+ 	}
+ 	err := w.ensureClusterSchemer(host).HostDropTables(ctx, host)
++	log.Info("CHAOSTRACE chi-drop-tables host=%s canDeleteAllPVCs=true err=%v", host.GetName(), err)
+ 
+ 	if err == nil {
+ 		w.a.V(1).
+diff --git a/pkg/controller/chi/worker-migrator.go b/pkg/controller/chi/worker-migrator.go
+index 6b2367fe..0e759f01 100644
+--- a/pkg/controller/chi/worker-migrator.go
++++ b/pkg/controller/chi/worker-migrator.go
+@@ -18,6 +18,7 @@ import (
+ 	"context"
+ 	"fmt"
+ 
++	log "github.com/altinity/clickhouse-operator/pkg/announcer"
+ 	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+ 	"github.com/altinity/clickhouse-operator/pkg/chop"
+ 	"github.com/altinity/clickhouse-operator/pkg/controller/common"
+@@ -114,6 +115,7 @@ func (w *worker) migrateTables(ctx context.Context, host *api.Host, opts *migrat
+ 		// makes it permanent across operator restarts. Status is left untouched here: the
+ 		// post-restart re-migration caller swallows this error, so writing status would poison the
+ 		// CR from a path that is allowed to fail.
++		log.Info("CHAOSTRACE chi-host-create-tables host=%s result=failed tablesCreatedMarked=false err=%v", host.GetName(), err)
+ 		return migrateTablesFailure(host, err)
+ 	}
+ 
+@@ -122,6 +124,7 @@ func (w *worker) migrateTables(ctx context.Context, host *api.Host, opts *migrat
+ 	// and recording the host on that path is the same defect as swallowing the error: the listing
+ 	// feeds HasData(), so a host that was never actually migrated would never be migrated again.
+ 	if util.IsContextDone(ctx) {
++		log.Info("CHAOSTRACE chi-host-create-tables host=%s result=contextDone tablesCreatedMarked=false", host.GetName())
+ 		return nil
+ 	}
+ 
+@@ -133,6 +136,7 @@ func (w *worker) migrateTables(ctx context.Context, host *api.Host, opts *migrat
+ 			host.Runtime.Address.ShardIndex, host.Runtime.Address.ReplicaIndex, host.Runtime.Address.ClusterName)
+ 
+ 	host.GetCR().IEnsureStatus().PushHostTablesCreated(w.c.namer.Name(interfaces.NameFQDN, host))
++	log.Info("CHAOSTRACE chi-host-create-tables host=%s result=ok tablesCreatedMarked=true fqdn=%s", host.GetName(), w.c.namer.Name(interfaces.NameFQDN, host))
+ 
+ 	return nil
+ }
+diff --git a/pkg/controller/chi/worker-reconciler-chi.go b/pkg/controller/chi/worker-reconciler-chi.go
+index 8ab4e773..945dd832 100644
+--- a/pkg/controller/chi/worker-reconciler-chi.go
++++ b/pkg/controller/chi/worker-reconciler-chi.go
+@@ -40,6 +40,20 @@ import (
+ 	"github.com/altinity/clickhouse-operator/pkg/util"
+ )
+ 
++// traceReconcileTrigger names the event class that led to reconcileCR. A nil old CR is the
++// ReconcileAdd path: CR creation, operator start-up, and the pod-driven recovery re-enqueues.
++func traceReconcileTrigger(old *api.ClickHouseInstallation) string {
++	if old == nil {
++		return "add"
++	}
++	return "update"
++}
++
++func traceCHIReconcileDecision(cr *api.ClickHouseInstallation, decision reconcileGateDecision) {
++	log.Info("CHAOSTRACE chi-reconcile-decision ns=%s name=%s decision=%s proceeds=%t",
++		cr.GetNamespace(), cr.GetName(), decision, decision.proceeds())
++}
++
+ // reconcileCR runs reconcile cycle for a Custom Resource
+ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstallation) error {
+ 	if util.IsContextDone(ctx) {
+@@ -102,6 +116,11 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstal
+ 	generationTheSame := w.isGenerationTheSame(old, new)
+ 	hasUnhealthyHosts := w.hasUnhealthyHosts(ctx, new)
+ 	operatorIPTheSame := w.isOperatorIPTheSame(prevCHOpIP)
++	log.Info("CHAOSTRACE chi-reconcile-enter ns=%s name=%s trigger=%s gen=%d rv=%s generationTheSame=%t hasUnhealthyHosts=%t operatorIPTheSame=%t afterFinalizerInstalled=%t hasActionsToDo=%t hostStatuses=[%s] %s",
++		new.GetNamespace(), new.GetName(), traceReconcileTrigger(old), new.GetGeneration(), new.GetResourceVersion(),
++		generationTheSame, hasUnhealthyHosts, operatorIPTheSame, afterFinalizerInstalled,
++		new.EnsureRuntime().ActionPlan.HasActionsToDo(), new.GetHostsAttributesCounters(),
++		api.TraceActionPlan(new.EnsureRuntime().ActionPlan))
+ 
+ 	switch {
+ 	case new.Spec.Suspend.Value():
+@@ -141,20 +160,27 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstal
+ 		hasHostNeedingStuckRecovery:     func() bool { return w.crHasHostNeedingStuckRecovery(ctx, new) },
+ 	}); decision {
+ 	case gateReconcileWork:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Info("CR has reconcile work - continue reconcile")
+ 	case gateFinalizerInstalled:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Info("isAfterFinalizerInstalled - continue reconcile-2")
+ 	case gateOperatorIPChanged:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Info("Operator IP changed - continue reconcile to refresh clickhouse-operator user networks")
+ 	case gateStuckHostRecovery:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Info("CR has a sustained-NotReady host - continue reconcile for stuck-host recovery")
+ 	case gateUnhealthyHosts:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Warning("Unhealthy hosts detected - continue reconcile for recovery")
+ 	case gateNothingToDo:
++		traceCHIReconcileDecision(new, decision)
+ 		w.a.M(new).F().Info("No reconcile work - abort reconcile. Decision: %s", decision)
+ 		metrics.CRReconcilesCompleted(ctx, new)
+ 		return nil
+ 	default:
++		traceCHIReconcileDecision(new, decision)
+ 		// Fail open. An unrecognised decision means the enum grew and this switch was not
+ 		// updated; reconciling redundantly is recoverable, silently dropping the event is the
+ 		// exact failure this gate exists to prevent.
+@@ -169,6 +195,8 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstal
+ 	w.setHostStatusesPreliminary(ctx, new)
+ 
+ 	if err := w.reconcile(ctx, new); err != nil {
++		log.Info("CHAOSTRACE chi-reconcile-end ns=%s name=%s result=error deferred=%t err=%q",
++			new.GetNamespace(), new.GetName(), errors.Is(err, common.ErrCRUDDeferred), err.Error())
+ 		if errors.Is(err, common.ErrCRUDDeferred) {
+ 			// A deferral is a postponement, not a failure. The host-level branch already recorded
+ 			// WHY; this records WHAT the skipped success block left behind, which is otherwise
+@@ -205,6 +233,7 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *api.ClickHouseInstal
+ 		w.finalizeReconcileAndMarkCompleted(ctx, new)
+ 
+ 		w.dropZKReplicas(ctx, new)
++		log.Info("CHAOSTRACE chi-reconcile-end ns=%s name=%s result=completed", new.GetNamespace(), new.GetName())
+ 
+ 		metrics.CRReconcilesCompleted(ctx, new)
+ 		metrics.CRReconcilesTimings(ctx, new, time.Since(startTime).Seconds())
+@@ -1220,6 +1249,9 @@ func (w *worker) reconcileHostMain(ctx context.Context, host *api.Host) error {
+ 	// 2. abort the reconcile completely
+ 	err := w.reconcileHostPVCs(ctx, host)
+ 	onDataLoss := host.GetCluster().GetReconcile().StatefulSet.Recreate.OnDataLoss
++	log.Info("CHAOSTRACE chi-host-pvc-check host=%s volumeAdded=%t dataLoss=%t volumeMissed=%t hasData=%t onDataLoss=%s err=%v",
++		host.GetName(), storage.ErrIsVolumeAdded(err), storage.ErrIsDataLoss(err), storage.ErrIsVolumeMissed(err),
++		host.HasData(), onDataLoss, err)
+ 	switch {
+ 	case storage.ErrIsVolumeAdded(err):
+ 		// A volume was ADDED to a host that already has data - the PVC is missing because it never
+@@ -1336,6 +1368,9 @@ func (w *worker) reconcileHostMainDomain(ctx context.Context, host *api.Host, mi
+ func (w *worker) reconcileHostTables(ctx context.Context, host *api.Host, opts *migrateTableOptions) error {
+ 	needMigrate := w.shouldMigrateTables(host, opts)
+ 	needFIPSCheck := chop.Config().Security.GetImages().IsRequired()
++	log.Info("CHAOSTRACE chi-host-migrate-decision host=%s needMigrate=%t forceMigrate=%t forceDropReplica=%t hasData=%t inNewCluster=%t stopped=%t",
++		host.GetName(), needMigrate, opts.ForceMigrate(), opts.ForceDropReplicaUponStorageLoss(),
++		host.HasData(), host.IsInNewCluster(), host.IsStopped())
+ 
+ 	if !needMigrate && !needFIPSCheck {
+ 		w.a.V(1).
+diff --git a/pkg/controller/chi/worker-status-helpers.go b/pkg/controller/chi/worker-status-helpers.go
+index 5ccf79ef..65509a87 100644
+--- a/pkg/controller/chi/worker-status-helpers.go
++++ b/pkg/controller/chi/worker-status-helpers.go
+@@ -306,8 +306,11 @@ func (w *worker) doesHostHaveNoRunningQueries(ctx context.Context, host *api.Hos
+ }
+ 
+ func (w *worker) doesHostHaveNoReplicationDelay(ctx context.Context, host *api.Host) bool {
+-	delay, _ := w.ensureClusterSchemer(host).HostMaxReplicaDelay(ctx, host)
++	delay, err := w.ensureClusterSchemer(host).HostMaxReplicaDelay(ctx, host)
+ 	log.V(1).Info("replication lag %d host: %s", delay, host.GetName())
++	log.Info("CHAOSTRACE chi-replication-lag-poll host=%s lag=%d threshold=%d caughtUp=%t err=%v",
++		host.GetName(), delay, chop.Config().Reconcile.Host.Wait.Replicas.Delay.IntValue(),
++		delay <= chop.Config().Reconcile.Host.Wait.Replicas.Delay.IntValue(), err)
+ 	return delay <= chop.Config().Reconcile.Host.Wait.Replicas.Delay.IntValue()
+ }
+ 
+diff --git a/pkg/controller/chi/worker-wait-exclude-include-restart.go b/pkg/controller/chi/worker-wait-exclude-include-restart.go
+index c47296a0..29b9c661 100644
+--- a/pkg/controller/chi/worker-wait-exclude-include-restart.go
++++ b/pkg/controller/chi/worker-wait-exclude-include-restart.go
+@@ -311,7 +311,11 @@ func (w *worker) ascendHostInClickHouseCluster(ctx context.Context, host *api.Ho
+ 
+ // catchReplicationLag
+ func (w *worker) catchReplicationLag(ctx context.Context, host *api.Host) error {
++	log.Info("CHAOSTRACE chi-replication-lag-decision host=%s created=%t listedCaughtUp=%t",
++		host.GetName(), host.GetReconcileAttributes().GetStatus().Is(types.ObjectStatusCreated),
++		host.HasListedReplicaCaughtUp(w.c.namer.Name(interfaces.NameFQDN, host)))
+ 	if !w.shouldWaitReplicationHost(host) {
++		log.Info("CHAOSTRACE chi-replication-lag-skip host=%s wait=false", host.GetName())
+ 		w.a.V(1).
+ 			M(host).F().
+ 			Info("No need to wait to catch replication lag. "+
+@@ -331,6 +335,7 @@ func (w *worker) catchReplicationLag(ctx context.Context, host *api.Host) error
+ 	w.addHostToMonitoring(host)
+ 
+ 	err := w.waitHostHasNoReplicationDelay(ctx, host)
++	log.Info("CHAOSTRACE chi-replication-lag-wait-end host=%s err=%v", host.GetName(), err)
+ 	if err == nil {
+ 		w.a.V(1).
+ 			M(host).F().
+diff --git a/pkg/controller/chk/controller.go b/pkg/controller/chk/controller.go
+index a00184ec..133062d4 100644
+--- a/pkg/controller/chk/controller.go
++++ b/pkg/controller/chk/controller.go
+@@ -128,6 +128,8 @@ func (c *Controller) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
+ // that is expected to clear within seconds. Match with errors.Is - the reconciler
+ // wraps the sentinel with host context on its way up.
+ func (c *Controller) reconcileResult(cr *apiChk.ClickHouseKeeperInstallation, err error) (ctrl.Result, error) {
++	log.Info("CHAOSTRACE chk-reconcile-result ns=%s name=%s deferred=%t requeueAfter=%s err=%v",
++		cr.GetNamespace(), cr.GetName(), errors.Is(err, common.ErrCRUDDeferred), raftQuorumDeferredRequeueAfter, err)
+ 	switch {
+ 	case err == nil:
+ 		return ctrl.Result{}, nil
+diff --git a/pkg/controller/chk/worker-raft-safety.go b/pkg/controller/chk/worker-raft-safety.go
+index 8a39d968..e90f209c 100644
+--- a/pkg/controller/chk/worker-raft-safety.go
++++ b/pkg/controller/chk/worker-raft-safety.go
+@@ -22,6 +22,7 @@ import (
+ 	apps "k8s.io/api/apps/v1"
+ 	apiErrors "k8s.io/apimachinery/pkg/api/errors"
+ 
++	log "github.com/altinity/clickhouse-operator/pkg/announcer"
+ 	apiChk "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse-keeper.altinity.com/v1"
+ 	api "github.com/altinity/clickhouse-operator/pkg/apis/clickhouse.altinity.com/v1"
+ 	"github.com/altinity/clickhouse-operator/pkg/apis/common/types"
+@@ -173,8 +174,11 @@ func (w *worker) snapshotHostEnsemble(ctx context.Context, host *api.Host) (host
+ 		// off both this gate and the Ready wait - the unsafe direction, and exactly the fan-out
+ 		// this gate exists to prevent. The Get already runs under GetWithRetry, so reaching here
+ 		// means a sustained outage worth a normal error requeue.
++		log.Info("CHAOSTRACE chk-quorum-snapshot host=%s id=%d result=error err=%v", host.GetName(), host.Runtime.Address.ReplicaIndex, err)
+ 		return hostEnsembleSnapshot{}, err
+ 	}
++	log.Info("CHAOSTRACE chk-quorum-snapshot host=%s id=%d members=%d ready=%d quorum=%d rolling=%t",
++		host.GetName(), host.Runtime.Address.ReplicaIndex, n, ready, raftQuorumSize(n), n <= 1 || ready >= raftQuorumSize(n))
+ 	return hostEnsembleSnapshot{
+ 		rolling:    n <= 1 || ready >= raftQuorumSize(n),
+ 		members:    n,
+@@ -253,11 +257,17 @@ func (w *worker) ensureQuorumSafeToDisruptHost(
+ 	snap *hostEnsembleSnapshot,
+ ) error {
+ 	if snap == nil || !snap.rolling || !ensembleHasQuorumHeadroom(snap.members) {
++		log.Info("CHAOSTRACE chk-quorum-check host=%s id=%d decision=proceed reason=notRollingOrNoHeadroom", host.GetName(), host.Runtime.Address.ReplicaIndex)
+ 		return nil
+ 	}
+ 	if !w.hostDisruptionWouldBreakQuorum(ctx, host, opts, *snap) {
++		log.Info("CHAOSTRACE chk-quorum-check host=%s id=%d decision=proceed reason=safe ready=%d quorum=%d hostReady=%t",
++			host.GetName(), host.Runtime.Address.ReplicaIndex, snap.readyCount, raftQuorumSize(snap.members), hostContributesReady(host))
+ 		return nil
+ 	}
++	log.Info("CHAOSTRACE chk-quorum-check host=%s id=%d decision=wait ready=%d quorum=%d hostReady=%t budgetLeft=%s",
++		host.GetName(), host.Runtime.Address.ReplicaIndex, snap.readyCount, raftQuorumSize(snap.members), hostContributesReady(host),
++		w.quorumDisruptWaitTimeout()-w.quorumWaitSpent)
+ 
+ 	// The budget spans the pass, not the host. The first gated host still gets the whole
+ 	// allowance, so a transient blip is absorbed exactly as before; later hosts share what is
+@@ -304,6 +314,7 @@ func (w *worker) ensureQuorumSafeToDisruptHost(
+ 		if err := w.refreshQuorumSnapshotCounts(ctx, host, snap); err != nil {
+ 			return err
+ 		}
++		log.Info("CHAOSTRACE chk-quorum-poll host=%s id=%d ready=%d quorum=%d", host.GetName(), host.Runtime.Address.ReplicaIndex, snap.readyCount, raftQuorumSize(snap.members))
+ 		if !w.hostDisruptionWouldBreakQuorum(ctx, host, opts, *snap) {
+ 			w.a.V(1).M(host).F().Info(
+ 				"Raft quorum headroom available — proceeding with host %s disruption (ready=%d)",
+@@ -320,6 +331,7 @@ func (w *worker) ensureQuorumSafeToDisruptHost(
+ // budget-exhausted path and the waited-and-still-unsafe path report identically: from the user's
+ // side both mean "this host was not touched because the ensemble could not afford it".
+ func (w *worker) deferQuorumDisrupt(host *api.Host, snap hostEnsembleSnapshot) error {
++	log.Info("CHAOSTRACE chk-quorum-defer host=%s id=%d %s", host.GetName(), host.Runtime.Address.ReplicaIndex, quorumDisruptDeferMessage(host, snap))
+ 	w.a.V(1).M(host).F().
+ 		WithEvent(host.GetCR(), a.EventActionReconcile, a.EventReasonHostReconcileDeferredShardSafety).
+ 		Warning(
+diff --git a/pkg/controller/chk/worker-reconciler-chk.go b/pkg/controller/chk/worker-reconciler-chk.go
+index 42d1468c..e2f327e8 100644
+--- a/pkg/controller/chk/worker-reconciler-chk.go
++++ b/pkg/controller/chk/worker-reconciler-chk.go
+@@ -38,6 +38,15 @@ import (
+ 	"github.com/altinity/clickhouse-operator/pkg/util"
+ )
+ 
++// traceCHKReconcileDecision records why a CHK reconcile proceeds or stops, including the status the
++// CR carried before this pass: a nothingToDo decision leaves that status untouched.
++func traceCHKReconcileDecision(cr *apiChk.ClickHouseKeeperInstallation, decision, statusBefore string) {
++	log.Info("CHAOSTRACE chk-reconcile-decision ns=%s name=%s decision=%s statusBefore=%s statusLeftUnchanged=%t hasActionsToDo=%t hostStatuses=[%s] %s",
++		cr.GetNamespace(), cr.GetName(), decision, statusBefore, decision == "nothingToDo",
++		cr.EnsureRuntime().ActionPlan.HasActionsToDo(), cr.GetHostsAttributesCounters(),
++		api.TraceActionPlan(cr.EnsureRuntime().ActionPlan))
++}
++
+ // reconcileCR runs reconcile cycle for a Custom Resource
+ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKeeperInstallation) error {
+ 	if util.IsContextDone(ctx) {
+@@ -46,6 +55,9 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
+ 	}
+ 
+ 	common.LogOldAndNew("non-normalized yet (native)", old, new)
++	traceStatusBefore := new.Status.GetStatus()
++	log.Info("CHAOSTRACE chk-reconcile-enter ns=%s name=%s gen=%d rv=%s status=%s hasAncestor=%t",
++		new.GetNamespace(), new.GetName(), new.GetGeneration(), new.GetResourceVersion(), traceStatusBefore, new.GetAncestorT() != nil)
+ 
+ 	switch {
+ 	case w.isAfterFinalizerInstalled(old, new):
+@@ -107,10 +119,13 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
+ 		}
+ 		return nil
+ 	case new.HasReconcileWork():
++		traceCHKReconcileDecision(new, "reconcileWork", traceStatusBefore)
+ 		w.a.M(new).F().Info("CR has reconcile work - continue reconcile")
+ 	case w.isAfterFinalizerInstalled(new.GetAncestorT(), new):
++		traceCHKReconcileDecision(new, "finalizerInstalled", traceStatusBefore)
+ 		w.a.M(new).F().Info("isAfterFinalizerInstalled - continue reconcile-2")
+ 	default:
++		traceCHKReconcileDecision(new, "nothingToDo", traceStatusBefore)
+ 		w.a.M(new).F().Info("No reconcile work - abort reconcile")
+ 		metrics.CRReconcilesCompleted(ctx, new)
+ 		return nil
+@@ -123,6 +138,8 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
+ 	w.setHostStatusesPreliminary(ctx, new)
+ 
+ 	if err := w.reconcile(ctx, new); err != nil {
++		log.Info("CHAOSTRACE chk-reconcile-end ns=%s name=%s result=error deferred=%t err=%q",
++			new.GetNamespace(), new.GetName(), errors.Is(err, common.ErrCRUDDeferred), err.Error())
+ 		if errors.Is(err, common.ErrCRUDDeferred) {
+ 			w.a.V(1).M(new).F().Info("Reconcile deferred — waiting for Raft quorum headroom")
+ 			new.EnsureStatus().PushError(fmt.Sprintf(
+@@ -165,6 +182,7 @@ func (w *worker) reconcileCR(ctx context.Context, old, new *apiChk.ClickHouseKee
+ 		return err
+ 	}
+ 
++	log.Info("CHAOSTRACE chk-reconcile-end ns=%s name=%s result=completed", new.GetNamespace(), new.GetName())
+ 	metrics.CRReconcilesCompleted(ctx, new)
+ 	metrics.CRReconcilesTimings(ctx, new, time.Since(startTime).Seconds())
+ 
+@@ -437,6 +455,9 @@ func (w *worker) reconcileHostStatefulSet(
+ 
+ 	w.stsReconciler.PrepareHostStatefulSetWithStatus(ctx, host, host.IsStopped())
+ 	opts = w.prepareStsReconcileOptsWaitSection(host, opts, snap.rolling)
++	log.Info("CHAOSTRACE chk-host-sts host=%s id=%d status=%s forceRecreate=%t rolling=%t members=%d ready=%d",
++		host.GetName(), host.Runtime.Address.ReplicaIndex, host.GetReconcileAttributes().GetStatus(),
++		opts.ForceRecreate(), snap.rolling, snap.members, snap.readyCount)
+ 	if err := w.ensureQuorumSafeToDisruptHost(ctx, host, opts, &snap); err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/controller/chk/worker-wait-exclude-include-restart.go b/pkg/controller/chk/worker-wait-exclude-include-restart.go
+index d2ff67bd..9b179b17 100644
+--- a/pkg/controller/chk/worker-wait-exclude-include-restart.go
++++ b/pkg/controller/chk/worker-wait-exclude-include-restart.go
+@@ -95,6 +95,7 @@ func (w *worker) includeHost(ctx context.Context, host *api.Host) error {
+ 
+ // includeHostIntoRaftCluster includes host into raft configuration
+ func (w *worker) includeHostIntoRaftCluster(ctx context.Context, host *api.Host) {
++	log.Info("CHAOSTRACE chk-raft-include host=%s id=%d status=%s", host.GetName(), host.Runtime.Address.ReplicaIndex, host.GetReconcileAttributes().GetStatus())
+ 	w.a.V(1).
+ 		M(host).F().
+ 		Info("going to include host. Host/shard/cluster: %d/%d/%s",
+diff --git a/pkg/controller/chk/worker.go b/pkg/controller/chk/worker.go
+index 759f17a2..4d127ba8 100644
+--- a/pkg/controller/chk/worker.go
++++ b/pkg/controller/chk/worker.go
+@@ -280,6 +280,7 @@ func (w *worker) markReconcileStart(ctx context.Context, cr *apiChk.ClickHouseKe
+ 			},
+ 		},
+ 	}); err != nil {
++		log.Info("CHAOSTRACE chk-reconcile-start ns=%s name=%s result=statusWriteFailed err=%v", cr.GetNamespace(), cr.GetName(), err)
+ 		return err
+ 	}
+ 
+@@ -290,6 +291,7 @@ func (w *worker) markReconcileStart(ctx context.Context, cr *apiChk.ClickHouseKe
+ 		M(cr).F().
+ 		Info("reconcile started, task id: %s", cr.GetSpecT().GetTaskID())
+ 	w.a.V(2).M(cr).F().Info("action plan\n%s\n", cr.EnsureRuntime().ActionPlan.String())
++	log.Info("CHAOSTRACE chk-reconcile-start ns=%s name=%s status=%s", cr.GetNamespace(), cr.GetName(), cr.EnsureStatus().GetStatus())
+ 	return nil
+ }
+ 
+@@ -313,6 +315,7 @@ func (w *worker) finalizeReconcileAndMarkCompleted(ctx context.Context, _cr *api
+ 			},
+ 		},
+ 	)
++	log.Info("CHAOSTRACE chk-reconcile-finalize ns=%s name=%s aborted=%t err=%v", _cr.GetNamespace(), _cr.GetName(), aborted, err)
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/controller/common/statefulset/statefulset-reconciler.go b/pkg/controller/common/statefulset/statefulset-reconciler.go
+index 823cfa42..4516a104 100644
+--- a/pkg/controller/common/statefulset/statefulset-reconciler.go
++++ b/pkg/controller/common/statefulset/statefulset-reconciler.go
+@@ -106,6 +106,7 @@ func (r *Reconciler) getStatefulSetStatus(host *api.Host) types.ObjectStatus {
+ 	)
+ 
+ 	cur, err := r.sts.Get(context.TODO(), new)
++	traceStatefulSetStatus(r.labeler, host, cur, new, err)
+ 	switch {
+ 	case (err == nil) && (cur != nil):
+ 		// StatefulSet is found
+@@ -132,6 +133,21 @@ func (r *Reconciler) getStatefulSetStatus(host *api.Host) types.ObjectStatus {
+ 	}
+ }
+ 
++// traceStatefulSetStatus records the inputs of the per-host drift check: whether the live
++// StatefulSet exists and the object-version label on the live and desired StatefulSets.
++func traceStatefulSetStatus(labeler interfaces.ILabeler, host *api.Host, cur, new *apps.StatefulSet, err error) {
++	curVersion, desiredVersion := "", ""
++	found := (err == nil) && (cur != nil)
++	if found {
++		curVersion, _ = labeler.GetObjectVersion(cur)
++	}
++	if new != nil {
++		desiredVersion, _ = labeler.GetObjectVersion(new)
++	}
++	log.Info("CHAOSTRACE sts-drift-check host=%s sts=%s found=%t notFound=%t hasAncestor=%t curVersion=%s desiredVersion=%s",
++		host.GetName(), util.NamespaceNameString(new), found, apiErrors.IsNotFound(err), host.HasAncestor(), curVersion, desiredVersion)
++}
++
+ // ReconcileStatefulSet reconciles StatefulSet of a host
+ func (r *Reconciler) ReconcileStatefulSet(
+ 	ctx context.Context,
+@@ -150,6 +166,7 @@ func (r *Reconciler) ReconcileStatefulSet(
+ 	defer r.a.V(2).M(host).E().Info(util.NamespaceNameString(newStatefulSet))
+ 
+ 	if host.GetReconcileAttributes().GetStatus().Is(types.ObjectStatusSame) {
++		log.Info("CHAOSTRACE sts-reconcile host=%s sts=%s status=%s action=skip-same", host.GetName(), util.NamespaceNameString(newStatefulSet), host.GetReconcileAttributes().GetStatus())
+ 		r.a.V(2).M(host).F().Info("No need to reconcile THE SAME StatefulSet: %s", util.NamespaceNameString(newStatefulSet))
+ 		if register {
+ 			host.GetCR().IEnsureStatus().HostUnchanged()
+@@ -173,6 +190,9 @@ func (r *Reconciler) ReconcileStatefulSet(
+ 		common.DumpStatefulSetDiff(host, host.Runtime.CurStatefulSet, newStatefulSet)
+ 	}
+ 
++	log.Info("CHAOSTRACE sts-reconcile host=%s sts=%s status=%s forceRecreate=%t notFound=%t getErr=%v",
++		host.GetName(), util.NamespaceNameString(newStatefulSet), host.GetReconcileAttributes().GetStatus(),
++		opts.ForceRecreate(), apiErrors.IsNotFound(err), err)
+ 	switch {
+ 	case opts.ForceRecreate():
+ 		// Force recreate prevails over all other requests
+@@ -220,7 +240,9 @@ func (r *Reconciler) recreateStatefulSet(ctx context.Context, host *api.Host, re
+ 	r.a.V(2).M(host).S().Info(util.NamespaceNameString(host.GetCR()))
+ 	defer r.a.V(2).M(host).E().Info(util.NamespaceNameString(host.GetCR()))
+ 
++	log.Info("CHAOSTRACE sts-recreate-delete-start host=%s sts=%s", host.GetName(), r.namer.Name(interfaces.NameStatefulSet, host))
+ 	if err := r.doDeleteStatefulSet(ctx, host); err != nil {
++		log.Info("CHAOSTRACE sts-recreate-delete-end host=%s result=failed err=%v", host.GetName(), err)
+ 		namespace := host.Runtime.Address.Namespace
+ 		name := r.namer.Name(interfaces.NameStatefulSet, host)
+ 		// Stable K8s Event/Status message (no err interpolation) so event-recorder dedupe
+@@ -238,6 +260,7 @@ func (r *Reconciler) recreateStatefulSet(ctx context.Context, host *api.Host, re
+ 		// resync will re-enqueue this CR. Host stays at Replicas=0 until then.
+ 		return err
+ 	}
++	log.Info("CHAOSTRACE sts-recreate-delete-end host=%s result=deleted", host.GetName())
+ 	_ = r.storage.ReconcilePVCs(ctx, host, api.DesiredStatefulSet)
+ 	return r.createStatefulSet(ctx, host, register, opts)
+ }
+@@ -319,6 +342,10 @@ func (r *Reconciler) updateStatefulSet(ctx context.Context, host *api.Host, regi
+ 	}
+ 
+ 	// Something is incorrect, need to decide next moves
++	log.Info("CHAOSTRACE sts-update-failed host=%s sts=%s/%s curReady=%t action=%v onUpdateFailure=%s switchToRecreate=%t",
++		host.GetName(), namespace, name, k8s.IsStatefulSetReady(curStatefulSet), action,
++		host.GetCluster().GetReconcile().StatefulSet.Recreate.OnUpdateFailure,
++		action == common.ErrCRUDRecreate && host.GetCluster().GetReconcile().StatefulSet.Recreate.OnUpdateFailure != api.OnStatefulSetRecreateOnUpdateFailureActionAbort)
+ 
+ 	switch action {
+ 	case common.ErrCRUDRecreate:
+@@ -403,6 +430,7 @@ func (r *Reconciler) createStatefulSet(ctx context.Context, host *api.Host, regi
+ 
+ func (r *Reconciler) shouldAbortOrContinueCreateStatefulSet(action error, host *api.Host) error {
+ 	statefulSet := host.Runtime.DesiredStatefulSet
++	log.Info("CHAOSTRACE sts-create-decision host=%s sts=%s action=%v", host.GetName(), util.NamespaceNameString(statefulSet), action)
+ 	switch action {
+ 	case nil:
+ 		// Continue
+@@ -462,6 +490,8 @@ func (r *Reconciler) doCreateStatefulSet(ctx context.Context, host *api.Host, op
+ 
+ 	log.V(1).Info("Create StatefulSet: %s", util.NamespaceNameString(statefulSet))
+ 	if _, err := r.sts.Create(ctx, statefulSet); err != nil {
++		log.Info("CHAOSTRACE sts-create host=%s sts=%s result=failed alreadyExists=%t invalid=%t err=%q",
++			host.GetName(), util.NamespaceNameString(statefulSet), apiErrors.IsAlreadyExists(err), apiErrors.IsInvalid(err), err.Error())
+ 		if apiErrors.IsAlreadyExists(err) {
+ 			log.V(1).M(host).F().Error(
+ 				"StatefulSet create failed - already exists (stale informer or prior failed delete). err: %v", err)
+@@ -471,8 +501,10 @@ func (r *Reconciler) doCreateStatefulSet(ctx context.Context, host *api.Host, op
+ 		return common.ErrCRUDRecreate
+ 	}
+ 
++	log.Info("CHAOSTRACE sts-create host=%s sts=%s result=created", host.GetName(), util.NamespaceNameString(statefulSet))
+ 	// StatefulSet created, wait until host is launched
+ 	if err := r.waitHostStatefulSetToLaunch(ctx, host, opts); err != nil {
++		log.Info("CHAOSTRACE sts-create-wait host=%s sts=%s result=failed err=%v", host.GetName(), util.NamespaceNameString(statefulSet), err)
+ 		log.V(1).M(host).F().Error("StatefulSet create wait failed. err: %v", err)
+ 		return r.fallback.OnStatefulSetCreateFailed(ctx, host)
+ 	}
+@@ -611,6 +643,8 @@ func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) er
+ 	// a Get fails for any reason other than NotFound, and an API blip outlasting the Get retries
+ 	// would otherwise SIGKILL a host that had just been asked to stop and was shutting down
+ 	// cleanly. Waiting out the budget is what earns the right to force.
++	log.Info("CHAOSTRACE sts-delete-scaledown host=%s sts=%s/%s timedOut=%t err=%v",
++		host.GetName(), namespace, name, errors.Is(scaleDownErr, poller.ErrTimeout), scaleDownErr)
+ 	if errors.Is(scaleDownErr, poller.ErrTimeout) {
+ 		// Events are POSTed straight at the API with Count:1 and a GenerateName (see
+ 		// announcer/event-emitter.go); there is no client-go correlator to aggregate repeats.
+@@ -650,6 +684,7 @@ func (r *Reconciler) doDeleteStatefulSet(ctx context.Context, host *api.Host) er
+ func (r *Reconciler) deleteHostPod(ctx context.Context, host *api.Host) error {
+ 	namespace := host.Runtime.Address.Namespace
+ 	name := r.namer.Name(interfaces.NamePod, host)
++	log.Info("CHAOSTRACE sts-force-delete-pod host=%s pod=%s/%s gracePeriod=0", host.GetName(), namespace, name)
+ 	if err := r.pod.Delete(ctx, namespace, name); err != nil {
+ 		if apiErrors.IsNotFound(err) {
+ 			log.V(1).M(host).Info("NEUTRAL not found Pod %s/%s", namespace, name)
+diff --git a/pkg/model/chi/schemer/schemer.go b/pkg/model/chi/schemer/schemer.go
+index 8e527371..bb53938c 100644
+--- a/pkg/model/chi/schemer/schemer.go
++++ b/pkg/model/chi/schemer/schemer.go
+@@ -73,6 +73,7 @@ func (s *ClusterSchemer) HostDropReplica(ctx context.Context, hostToRunOn, hostT
+ 	replica := s.Name(interfaces.NameInstanceHostname, hostToDrop)
+ 	shard := hostToRunOn.Runtime.Address.ShardIndex
+ 	log.V(1).M(hostToRunOn).F().Info("Drop replica: %v at %v", replica, hostToRunOn.Runtime.Address.HostName)
++	log.Info("CHAOSTRACE chi-sql-drop-replica runOn=%s replica=%s sql=%q", hostToRunOn.Runtime.Address.HostName, replica, s.sqlDropReplica(shard, replica))
+ 	return s.ExecHost(ctx, hostToRunOn, s.sqlDropReplica(shard, replica),
+ 		clickhouse.NewQueryOptions().SetRetry(false).SetLogQueries(true))
+ }
+@@ -113,6 +114,9 @@ func (s *ClusterSchemer) HostCreateTables(ctx context.Context, host *api.Host) e
+ 		distributedObjectNames,
+ 		distributedCreateSQLs := s.createTablesSQLs(ctx, host)
+ 
++	log.Info("CHAOSTRACE chi-sql-create-tables-plan host=%s replicated=%v distributed=%v",
++		host.Runtime.Address.HostName, replicatedObjectNames, distributedObjectNames)
++
+ 	var err1 error
+ 	if len(replicatedCreateSQLs) > 0 {
+ 		log.V(1).M(host).F().Info("Creating replicated objects at %s: %v", host.Runtime.Address.HostName, replicatedObjectNames)
+@@ -143,6 +147,7 @@ func (s *ClusterSchemer) HostCreateTables(ctx context.Context, host *api.Host) e
+ func (s *ClusterSchemer) HostDropTables(ctx context.Context, host *api.Host) error {
+ 	tableNames, dropTableSQLs, _ := s.sqlDropTable(ctx, host)
+ 	log.V(1).M(host).F().Info("Drop tables: %v as %v", tableNames, dropTableSQLs)
++	log.Info("CHAOSTRACE chi-sql-drop-tables host=%s tables=%v", host.Runtime.Address.HostName, tableNames)
+ 	return s.ExecHost(ctx, host, dropTableSQLs,
+ 		clickhouse.NewQueryOptions().SetRetry(false).SetLogQueries(true))
+ }

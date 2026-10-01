@@ -58,6 +58,11 @@ class Scenario:
     performance: bool = False
     #: adapter capabilities the trigger needs (see OperatorAdapter.capabilities)
     requires: frozenset = frozenset()
+    #: seconds of continuous health before "recovered" counts; raise it for changes an
+    #: operator applies host by host without a done() predicate, so a gap between hosts can't pass
+    stable_samples: int = 6
+    #: give up waiting when nothing changes for this long while unhealthy (see await_recovery)
+    stall_s: int = 180
     #: touches something shared by every namespace (the operator, a node, cluster-wide API load),
     #: so it runs alone after the parallel batch
     exclusive: bool = False
@@ -102,6 +107,7 @@ class Context:
         self.scenario: Scenario | None = None
         self.recovered_at: float | None = None
         self.status_converged_at: float | None = None
+        self.status_grace_s = 0
         self.samples: list[dict] = []
         self.notes: dict = {}
 
@@ -143,22 +149,61 @@ class Context:
     def healthy(self, snap: dict) -> bool:
         return snap["servers_ready"] == self.spec.hosts and snap["keepers_ready"] == self.spec.keepers
 
-    def await_recovery(self, timeout: int | None = None, status_grace_s: int = 180) -> bool:
+    def progress_signature(self) -> tuple:
+        """Everything that changes while an operator is working: pods (identity, readiness,
+        restarts), StatefulSets (existence, replicas, generation) and the reported phase."""
+        ns = self.spec.namespace
+        pods = tuple(sorted(
+            (p["metadata"]["name"], p["metadata"]["uid"], pod_ready(p), p["status"].get("phase"),
+             sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses") or []))
+            for p in self.kube.items("pods", ns) if not p["metadata"]["labels"].get("chaosmonkey")))
+        sts = tuple(sorted((s["metadata"]["name"], s["spec"].get("replicas"), s["metadata"].get("generation"),
+                            s["status"].get("readyReplicas")) for s in self.kube.items("statefulsets", ns)))
+        return pods, sts, self.op.state(self.spec).phase
+
+    def observe(self, max_s: int, settle_s: int = 45, min_s: int = 30) -> None:
+        """Watch a held fault and record samples, ending once nothing has changed for settle_s:
+        the operator has made its decision, so a longer hold only repeats the same samples."""
+        start = time.time()
+        last_sig, last_change = None, time.time()
+        while time.time() - start < max_s:
+            self.snapshot()
+            sig = self.progress_signature()
+            if sig != last_sig:
+                last_sig, last_change = sig, time.time()
+            elif time.time() - start >= min_s and time.time() - last_change >= settle_s:
+                break
+            time.sleep(1)
+
+    def await_recovery(self, timeout: int | None = None, status_grace_s: int = 300,
+                       stall_s: int | None = None) -> bool:
         """Poll until every pod is Ready and the scenario is done, then give the reported status
         status_grace_s to agree.
+
+        Stops early when the cluster is unhealthy and nothing at all has changed for stall_s: an
+        operator that has stopped acting will not recover in the remaining time, and waiting out a
+        20-minute limit for it is most of a run's wall-clock.
 
         Records: time until healthy (from when the fault was cleared, or from injection), time
         until the status says reconciled, and every sample where the status claimed healthy while
         pods were not."""
         timeout = timeout or self.result_expect().recover_within_s
+        self.status_grace_s = status_grace_s
+        stall_s = stall_s or (self.scenario.stall_s if self.scenario else 180)
         deadline = time.time() + timeout
-        streak = 0
-        while time.time() < deadline:
+        streak, streak_start = 0, None
+        last_sig, last_change = None, time.time()
+        # the status grace runs past the recovery deadline: a cluster that heals late still gets it
+        while time.time() < deadline or self.recovered_at is not None:
             snap = self.snapshot()
             ok = self.healthy(snap) and (self.scenario is None or self.scenario.done(self))
+            if ok and streak == 0:
+                streak_start = time.time()
             streak = streak + 1 if ok else 0
-            if streak >= 2 and self.recovered_at is None:
-                self.recovered_at = self.since_reference()
+            need = self.scenario.stable_samples if self.scenario else 6
+            if self.recovered_at is None and streak >= 1 and time.time() - (streak_start or time.time()) >= need:
+                # recovered when health began, not when the stability window closed
+                self.recovered_at = streak_start - (self.t_cleared or self.t_inject)
                 self.recovered_wall = time.time()
             if self.recovered_at is not None:
                 if snap["reconciled"]:
@@ -166,7 +211,14 @@ class Context:
                     return True
                 if time.time() - self.recovered_wall > status_grace_s:
                     return True
-            time.sleep(3)
+            else:
+                sig = self.progress_signature()
+                if sig != last_sig:
+                    last_sig, last_change = sig, time.time()
+                elif time.time() - last_change > stall_s:
+                    self.notes["stalled_after_s"] = round(time.time() - last_change)
+                    return False
+            time.sleep(1)
         return self.recovered_at is not None
 
     def result_expect(self) -> Expectations:

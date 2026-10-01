@@ -1,0 +1,10 @@
+{
+  "targets": [
+    {"operator": "altinity", "version": "0.27.4", "image": "clickhouse-operator:trace-0.27.4", "label": "0.27.4-trace",
+     "scenarios": ["server-statefulset-deleted", "query-service-deleted", "scale-down-shard-then-up",
+                   "replica-volume-lost", "invalid-spec-no-damage", "wedged-shutdown-recreate",
+                   "operator-kill-mid-keeper-repair"]},
+    {"operator": "clickhouse", "version": "0.0.8", "image": "clickhouse-operator-official:trace-v0.0.8", "label": "0.0.8-trace",
+     "scenarios": ["scale-down-replica-metadata", "scale-down-shard-then-up", "scale-up-replica"]}
+  ]
+}

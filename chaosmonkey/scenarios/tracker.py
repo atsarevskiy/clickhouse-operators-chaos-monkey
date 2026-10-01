@@ -92,7 +92,7 @@ class ScaleDownShardLeavesMetadata(Scenario):
         ctx.workload.surplus_label = "stale data resurrected on re-added shard"
         ctx.notes["removed_shard"] = ctx.spec.shards - 1
         ctx.reapply(ctx.spec.copy(shards=ctx.spec.shards - 1))
-        wait_until(lambda: len(ctx.op.server_pods(ctx.spec)) == ctx.spec.hosts, timeout=600, interval=3)
+        wait_until(lambda: len(ctx.op.server_pods(ctx.spec)) == ctx.spec.hosts, timeout=600, interval=1)
         ctx.await_recovery(timeout=300)
         ctx.recovered_at = None
         ctx.status_converged_at = None
@@ -232,7 +232,7 @@ class MigrationFailureMarkedDone(Scenario):
                 for pod in ctx.op.server_pods(ctx.spec, replica=ctx.spec.replicas - 1):
                     if not ctx.workload.table_count(pod["metadata"]["name"]):
                         claimed.append(pod["metadata"]["name"])
-            time.sleep(3)
+            time.sleep(1)
         ctx.notes["claimed_done_without_schema"] = sorted(set(claimed))
 
     def recover(self, ctx: Context) -> None:
@@ -301,7 +301,7 @@ class ForegroundDeletion(Scenario):
     def recover(self, ctx: Context) -> None:
         def gone() -> bool:
             return all(not ctx.kube.items(kind, ctx.spec.namespace) for kind in ctx.op.cr_kinds)
-        t = wait_until(gone, timeout=ctx.result_expect().recover_within_s, interval=3)
+        t = wait_until(gone, timeout=ctx.result_expect().recover_within_s, interval=1)
         ctx.result.measure("foreground_delete_s", t, "s")
         ctx.recovered_at = t if t is not None else None
         if t is None:
@@ -345,7 +345,7 @@ class DeletionWithoutOperator(Scenario):
     def recover(self, ctx: Context) -> None:
         def gone() -> bool:
             return all(not ctx.kube.items(kind, ctx.spec.namespace) for kind in ctx.op.cr_kinds)
-        t = wait_until(gone, timeout=ctx.result_expect().recover_within_s, interval=3)
+        t = wait_until(gone, timeout=ctx.result_expect().recover_within_s, interval=1)
         ctx.result.measure("delete_completed_after_operator_return_s", t, "s")
         ctx.recovered_at = t if t is not None else None
         if t is None:
@@ -471,10 +471,7 @@ class StuckTerminatingPod(Scenario):
         ctx.notes["held"] = pod
         ctx.kube.patch("pod", pod, ctx.spec.namespace, {"metadata": {"finalizers": ["chaosmonkey/hold"]}})
         ctx.reapply(ctx.spec.copy(pod_annotations={**ctx.spec.pod_annotations, "chaosmonkey/roll": str(int(time.time()))}))
-        end = time.time() + self.hold_s
-        while time.time() < end:
-            ctx.snapshot()
-            time.sleep(3)
+        ctx.observe(self.hold_s)
         ctx.notes["fault_samples"] = list(ctx.samples)
 
     def recover(self, ctx: Context) -> None:
@@ -511,10 +508,7 @@ class UnschedulableRollout(Scenario):
     def inject(self, ctx: Context) -> None:
         self.good = ctx.spec
         ctx.reapply(ctx.spec.copy(node_selector={"chaosmonkey/no-such-node": "true"}))
-        end = time.time() + self.hold_s
-        while time.time() < end:
-            ctx.snapshot()
-            time.sleep(3)
+        ctx.observe(self.hold_s)
         ctx.notes["fault_samples"] = list(ctx.samples)
 
     def recover(self, ctx: Context) -> None:
@@ -533,7 +527,7 @@ class StorageClassChange(Scenario):
 
     def __init__(self):
         super().__init__(
-            id="storage-class-change", category="spec", min_replicas=2,
+            id="storage-class-change", category="spec", min_replicas=2, stable_samples=45,
             related_issues=["ClickHouse/clickhouse-operator#133"],
             title="Change the data volumes' StorageClass",
             description="Switch the volume claim to a second StorageClass with the same provisioner. Data must "

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -27,12 +28,22 @@ PERF_MEASURES = [
 ]
 
 
+def _base(scenario_id: str) -> str:
+    return scenario_id.split("#")[0]
+
+
 def load(paths: list[Path]) -> list[dict]:
-    results = []
+    """Results from every path. A later path's results for a scenario replace an earlier path's
+    for the same operator build, so a rerun of a few scenarios can be laid over a full run."""
+    results: list[dict] = []
     for p in paths:
         f = p / "results.json" if p.is_dir() else p
-        if f.exists():
-            results.extend(json.loads(f.read_text()))
+        if not f.exists():
+            continue
+        new = json.loads(f.read_text())
+        replaced = {(r["operator"], r["version"], _base(r["scenario"])) for r in new}
+        results = [r for r in results if (r["operator"], r["version"], _base(r["scenario"])) not in replaced]
+        results.extend(new)
     return results
 
 
@@ -147,4 +158,156 @@ def scorecard(results: list[dict]) -> str:
                          + " | ".join(_m(r, k) for k, _ in KEY_MEASURES)
                          + f" | {notes.replace('|', '/')} |")
         lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- README results table
+
+_PLAIN = {
+    "recovery": "never got back to healthy",
+    "recovery time": "recovered, but slower than the target",
+    "status truthfulness": "status reported healthy while hosts were down",
+    "status stuck": "status never reported healthy after every pod was Ready",
+    "availability": "clients saw an outage",
+    "keeper quorum": "Keeper lost quorum",
+    "data loss": "rows were lost",
+    "data": "a replica could not be read",
+    "stream": "a replica could not read the stream table",
+    "replica not caught up": "a replica did not catch up on replication",
+    "acknowledged writes lost": "acknowledged writes were lost",
+    "replica divergence": "replicas of a shard diverged",
+    "stream duplicates": "some writes were stored twice",
+    "writes after recovery": "writes failed after recovery",
+    "blast radius": "took down more than it should have",
+    "destructive on invalid spec": "destroyed a host applying a rejected spec",
+    "drift repair": "a deleted object was not recreated",
+    "replica metadata": "removed replica still registered",
+    "keeper metadata": "removed replica still registered in Keeper",
+    "replica cleanup": "removed replica still registered",
+    "schema propagation": "a new replica had no schema",
+    "premature publishing": "served clients before its schema existed",
+    "orphaned objects": "left objects behind after deletion",
+    "stale data resurrected on re-added shard": "old data came back with a re-added shard",
+    "keeper leadership": "Keeper had no leader for too long",
+    "shard re-added": "a re-added shard did not work",
+}
+
+
+def _clean(detail: str, limit: int = 220) -> str:
+    """One line of a finding, without the ClickHouse client's exception boilerplate."""
+    text = re.sub(r"Received exception from server \(version [^)]*\):\s*", "", detail)
+    text = re.sub(r"Code: \d+\. DB::Exception: (Received from \S+ )?(DB::Exception: )?", "", text)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
+
+
+def _value(r: dict, name: str):
+    for m in r.get("measurements", []):
+        if m["name"] == name:
+            return m["value"]
+    return None
+
+
+def _happened(r: dict) -> str:
+    """What the run observed: the findings first, then the numbers that back them."""
+    if r["verdict"] == "SKIPPED":
+        return "not run: the trigger needs " + r.get("summary", "").split(": ", 1)[-1] + ", which this operator lacks"
+    if r["verdict"] == "ERROR":
+        return "harness error: " + _clean(r.get("summary", ""), 120)
+    grouped: dict[str, list[str]] = {}
+    for f in r.get("findings", []):
+        if f["severity"] in ("fail", "warn"):
+            details = grouped.setdefault(_PLAIN.get(f["check"], f["check"]), [])
+            if _clean(f["detail"]) not in details:
+                details.append(_clean(f["detail"]))
+    parts = [f"{label}: {' and '.join(details)}" for label, details in grouped.items()]
+    rec, lag = _value(r, "time_to_recover_s"), _value(r, "status_lag_after_ready_s")
+    if rec is not None:
+        parts.append(f"healthy {rec:.0f} s after the fault ended"
+                     + (f", status agreed {lag:.0f} s later" if lag and lag >= 5 else ""))
+    ro, wo = _value(r, "longest_read_outage_s"), _value(r, "longest_write_outage_s")
+    if (ro is not None or wo is not None) and "availability" not in {f["check"] for f in r.get("findings", [])}:
+        parts.append(f"longest outage read {ro if ro is not None else '-'} s / write {wo if wo is not None else '-'} s")
+    acked, lost = _value(r, "stream_batches_acked_total"), _value(r, "stream_acked_batches_lost")
+    if acked:
+        parts.append(f"{lost or 0} of {acked} acknowledged batches lost")
+    return "; ".join(parts)
+
+
+def _expected(scenario_id: str) -> str:
+    from . import scenarios
+    s = scenarios.BY_ID.get(scenario_id.split("#")[0])
+    if s is None:
+        return "-"
+    e = s.expect
+    targets = [f"healthy within {e.recover_slo_s} s"] if e.cluster_survives else []
+    if e.max_read_outage_s is not None:
+        targets.append(f"read outage up to {e.max_read_outage_s} s")
+    if e.max_write_outage_s is not None:
+        targets.append(f"write outage up to {e.max_write_outage_s} s")
+    if e.data_must_survive and e.cluster_survives:
+        targets.append("no row lost")
+    return s.description + (" Targets: " + ", ".join(targets) + "." if targets else "")
+
+
+def summary_table(results: list[dict]) -> str:
+    targets = sorted({(r["operator"], r["version"]) for r in results})
+    cats = sorted({r["category"] for r in results if r["category"] != "performance"})
+    head = ["Operator", "Score", "PASS", "DEGRADED", "FAIL", "SKIPPED"] + cats
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for t in targets:
+        rs = [r for r in results if (r["operator"], r["version"]) == t and r["category"] != "performance"]
+        # a scenario run several times scores the average of its runs, and counts once
+        runs: dict[str, list[dict]] = defaultdict(list)
+        for r in rs:
+            runs[_base(r["scenario"])].append(r)
+        scored = {sid: (rr[0]["category"], sum(POINTS[r["verdict"]] for r in rr if r["verdict"] in POINTS)
+                        / len([r for r in rr if r["verdict"] in POINTS]))
+                  for sid, rr in runs.items() if any(r["verdict"] in POINTS for r in rr)}
+        c = defaultdict(int)
+        for r in rs:
+            c[r["verdict"]] += 1
+        row = [f"{t[0]} {t[1]}", f"**{sum(v for _, v in scored.values()) / len(scored):.0f}/100**" if scored else "-",
+               str(c["PASS"]), str(c["DEGRADED"]), str(c["FAIL"]), str(c["SKIPPED"])]
+        for cat in cats:
+            cr = [v for k, v in scored.values() if k == cat]
+            row.append(f"{sum(cr) / len(cr):.0f}" if cr else "-")
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def readme_table(results: list[dict]) -> str:
+    targets = sorted({(r["operator"], r["version"]) for r in results})
+    index: dict[tuple, list[dict]] = defaultdict(list)
+    for r in results:
+        index[(r["operator"], r["version"], _base(r["scenario"]))].append(r)
+    order = []
+    for r in results:
+        if _base(r["scenario"]) not in order:
+            order.append(_base(r["scenario"]))
+    head = ["Category", "Scenario", "Expected"]
+    for o, v in targets:
+        head += [f"{o} {v}", f"What happened ({o})"]
+    lines = [summary_table(results), "",
+             "Score per scenario: PASS 100, DEGRADED 50, FAIL 0; the operator score averages the resilience "
+             "scenarios it ran (performance and SKIPPED excluded), a repeated scenario counting once with the "
+             "average of its runs. PASS/DEGRADED/FAIL/SKIPPED count runs.", "",
+             "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for s in order:
+        runs = [index.get((o, v, s), []) for o, v in targets]
+        cat = next(rr[0]["category"] for rr in runs if rr)
+        row = [cat, f"`{s}`", _expected(s)]
+        for rr in runs:
+            if not rr:
+                row += ["-", "-"]
+                continue
+            verdicts = " / ".join(r["verdict"] + (f" ({POINTS[r['verdict']]})" if r["verdict"] in POINTS else "")
+                                  for r in rr)
+            # with repeats, describe the worst run and say how the others went
+            worst = min(rr, key=lambda r: POINTS.get(r["verdict"], 101))
+            text = _happened(worst) or "recovered cleanly"
+            if len(rr) > 1:
+                text = f"{len(rr)} runs; worst: " + text
+            row += [verdicts, text]
+        lines.append("| " + " | ".join(c.replace("|", "/") for c in row) + " |")
     return "\n".join(lines)

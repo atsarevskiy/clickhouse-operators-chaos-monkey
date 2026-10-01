@@ -116,10 +116,7 @@ class BadConfigRollout(Scenario):
         self.good = ctx.spec
         bad = ctx.spec.copy(server_settings={**ctx.spec.server_settings, "max_concurrent_queries": "not-a-number"})
         ctx.reapply(bad)
-        end = time.time() + self.observe_s
-        while time.time() < end:
-            ctx.snapshot()
-            time.sleep(3)
+        ctx.observe(self.observe_s)
         ctx.notes["bad_phase_samples"] = list(ctx.samples)
 
     def recover(self, ctx: Context) -> None:

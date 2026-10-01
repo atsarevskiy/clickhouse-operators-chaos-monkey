@@ -10,6 +10,8 @@ from __future__ import annotations
 import abc
 
 from ..cluster import K3dCluster
+import time
+
 from ..kube import Kube, pod_ready, wait_until
 from ..model import ClusterSpec, ClusterState, Finding
 
@@ -169,6 +171,56 @@ class OperatorAdapter(abc.ABC):
 
     def wait_operator_ready(self, timeout: int = 180) -> bool:
         return wait_until(lambda: any(pod_ready(p) for p in self.operator_pods()), timeout) is not None
+
+    def start_log_capture(self, path) -> None:
+        """Follow the operator's log into a file for the whole run, re-attaching when the pod is
+        replaced, so a scenario's window can be read back even after rotation or a restart."""
+        import subprocess
+        import threading
+
+        def follow() -> None:
+            with open(path, "a") as out:
+                while not getattr(self, "_capture_stop", False):
+                    pods = self.operator_pods()
+                    if not pods:
+                        time.sleep(2)
+                        continue
+                    name = pods[0]["metadata"]["name"]
+                    proc = subprocess.Popen(["kubectl", "--context", self.cluster.context, "logs", "-f",
+                                             "-n", self.operator_namespace, name, "--since=1s"],
+                                            stdout=out, stderr=subprocess.DEVNULL)
+                    self._capture_proc = proc
+                    proc.wait()
+                    time.sleep(1)
+
+        self._capture_stop = False
+        self._capture_path = path
+        threading.Thread(target=follow, daemon=True, name=f"{self.name}-log").start()
+
+    def stop_log_capture(self) -> None:
+        self._capture_stop = True
+        proc = getattr(self, "_capture_proc", None)
+        if proc:
+            proc.terminate()
+
+    def captured_logs(self, since_rfc: str) -> str | None:
+        """Lines of the followed log from since_rfc on, or None when no capture is running."""
+        path = getattr(self, "_capture_path", None)
+        if not path:
+            return None
+        keep, out = False, []
+        with open(path, errors="replace") as f:
+            for line in f:
+                if not keep:
+                    stamp = line[:20]
+                    if stamp[:4].isdigit() and stamp >= since_rfc:
+                        keep = True
+                    elif line[:1] in "IWE" and line[1:5].isdigit():
+                        # klog lines (Altinity): Lmmdd hh:mm:ss.uuuuuu; compare the time of day
+                        keep = line[6:14] >= since_rfc[11:19] and line[1:5] == since_rfc[5:7] + since_rfc[8:10]
+                if keep:
+                    out.append(line)
+        return "".join(out)
 
     def operator_logs(self, since_time: str | None = None) -> str:
         out = []

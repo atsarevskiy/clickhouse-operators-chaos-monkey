@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import traceback
@@ -75,7 +76,9 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                  out_dir: Path) -> ScenarioResult:
     result = ScenarioResult(scenario.id, scenario.category, op.name, op.version,
                             related_issues=list(scenario.related_issues))
-    spec = scenario.spec_for(base).copy(namespace=f"cm-{scenario.id}"[:63])
+    # scenario ids can carry a repeat suffix ("node-drain#2"); namespaces allow only [a-z0-9-]
+    ns = re.sub(r"[^a-z0-9-]+", "-", f"cm-{scenario.id}".lower())[:63].strip("-")
+    spec = scenario.spec_for(base).copy(namespace=ns)
     started = time.time()
     started_rfc = now_rfc3339()
     ctx: Context | None = None
@@ -92,7 +95,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         _log(f"  baseline {spec.shards}x{spec.replicas} + {spec.keepers} keepers")
         t0 = time.time()
         op.apply(spec)
-        created = wait_until(lambda: baseline_healthy(op, spec), BASELINE_TIMEOUT_S, interval=3)
+        created = wait_until(lambda: baseline_healthy(op, spec), BASELINE_TIMEOUT_S, interval=1)
         result.measure("baseline_create_s", created, "s", f"{spec.shards}x{spec.replicas}+{spec.keepers}")
         if created is None:
             result.verdict, result.summary = "ERROR", f"baseline never became healthy ({op.state(spec).phase})"
@@ -105,7 +108,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
             result.verdict, result.summary = "ERROR", "workload setup failed on a healthy baseline"
             return result
         workload.start_probes()
-        time.sleep(10)
+        time.sleep(5)
 
         ctx = Context(op, cluster, spec, workload, result)
         ctx.notes["expect"] = scenario.expect
@@ -123,6 +126,11 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         # recovery
         if not exp.cluster_survives:
             pass
+        elif ctx.recovered_at is None and ctx.notes.get("stalled_after_s"):
+            result.add("fail", "recovery", f"stalled: no pod, StatefulSet or status change for "
+                                           f"{ctx.notes['stalled_after_s']}s while unhealthy "
+                                           f"({op.ready_servers(spec)}/{spec.hosts} servers, "
+                                           f"{op.ready_keepers(spec)}/{spec.keepers} keepers Ready)")
         elif ctx.recovered_at is None:
             result.add("fail", "recovery", f"cluster not healthy {int(t_end - ctx.t_inject)}s after the failure "
                                            f"({op.ready_servers(spec)}/{spec.hosts} servers, "
@@ -133,13 +141,18 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                 result.add("warn", "recovery time", f"{ctx.recovered_at:.0f}s, target {exp.recover_slo_s}s")
         if exp.status_must_converge and exp.cluster_survives and ctx.recovered_at is not None:
             if ctx.status_converged_at is None:
-                result.add("warn", "status truthfulness",
-                           f"every pod Ready but the operator still reports {op.state(spec).phase}")
+                result.add("warn", "status stuck",
+                           f"operator still reports {op.state(spec).phase} "
+                           f"{ctx.status_grace_s}s after every pod was Ready")
             else:
                 result.measure("time_to_status_healthy_s", ctx.status_converged_at, "s")
+                # pods Ready first and status later is an operator still applying the change
+                # (config pushed host by host, say), which is honest; only a status that never
+                # catches up is a finding
+                result.measure("status_lag_after_ready_s", ctx.status_converged_at - ctx.recovered_at, "s")
         lying = [s for s in ctx.samples if s["reconciled"] and not ctx.healthy(s)]
         if lying:
-            seconds = 3 * len(lying)
+            seconds = len(lying)
             result.measure("status_healthy_while_pods_down_s", seconds, "s",
                            "status reported healthy while pods were not Ready")
             # A brief overlap is normal while the operator is still observing; a sustained one means
@@ -162,7 +175,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
 
         # availability during the scenario. The probes sample once a second, so a short scenario is
         # given a minimum window before the ratios are computed.
-        MIN_PROBE_WINDOW_S = 60
+        MIN_PROBE_WINDOW_S = 30
         remaining = MIN_PROBE_WINDOW_S - (time.time() - ctx.t_inject)
         if remaining > 0:
             time.sleep(remaining)
@@ -208,7 +221,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         # only findings still present after a second look count
         first = op.verify_operator_state(spec)
         if first:
-            time.sleep(30)
+            time.sleep(15)
             again = {(f.check, f.detail) for f in op.verify_operator_state(spec)}
             result.findings.extend(f for f in first if (f.check, f.detail) in again)
         scenario.verify(ctx)
@@ -237,10 +250,33 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         # Only this scenario's window, and split per custom resource: one controller's reconcile
         # loop can otherwise bury the lines that explain the scenario.
         try:
-            log = op.operator_logs(since_time=started_rfc)
-            (out_dir / f"{scenario.id}.operator.log").write_text(log[-4_000_000:])
+            log = op.captured_logs(started_rfc)
+            if log is None:
+                log = op.operator_logs(since_time=started_rfc)
+            (out_dir / f"{scenario.id}.operator.log").write_text(log[-20_000_000:])
             lines = [ln for ln in log.splitlines() if spec.namespace in ln]
             (out_dir / f"{scenario.id}.operator.namespace.log").write_text("\n".join(lines)[-4_000_000:])
+            # an operator built from tracing/<operator>/ marks its decision points with CHAOSTRACE.
+            # Only from the injection on: the baseline's own creation decisions (a missing volume on
+            # first start, the first schema plan) otherwise read like the reaction to the fault.
+            after = (op.captured_logs(ctx.t_inject_rfc) if ctx is not None and ctx.t_inject_rfc else None) or log
+            trace = [ln for ln in after.splitlines() if spec.namespace in ln and "CHAOSTRACE" in ln]
+            if trace:
+                (out_dir / f"{scenario.id}.trace.log").write_text("\n".join(trace))
+        except Exception:  # noqa: BLE001
+            pass
+        # logs of every pod that is not Ready at the end: the failing component's own account of why
+        try:
+            chunks = []
+            for pod in op.kube.items("pods", spec.namespace):
+                if pod_ready(pod) or pod["metadata"]["labels"].get("chaosmonkey"):
+                    continue
+                name = pod["metadata"]["name"]
+                for c in [x["name"] for x in pod["spec"].get("containers", [])]:
+                    chunks.append(f"===== {name}/{c}\n" + op.kube.run(
+                        "logs", "-n", spec.namespace, name, "-c", c, "--tail=300", check=False, timeout=60))
+            if chunks:
+                (out_dir / f"{scenario.id}.unready-pods.log").write_text("\n".join(chunks))
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -262,6 +298,7 @@ def run_target(op: OperatorAdapter, cluster: K3dCluster, scenarios: list[Scenari
     cluster.create()
     _log(f"operator {op.name} {op.version}: installing")
     op.install(env)
+    op.start_log_capture(out_dir / "operator.full.log")
     shared = [s for s in scenarios if not s.runs_alone]
     alone = [s for s in scenarios if s.runs_alone]
     results: dict[str, ScenarioResult] = {}
@@ -286,5 +323,6 @@ def run_target(op: OperatorAdapter, cluster: K3dCluster, scenarios: list[Scenari
             list(pool.map(one, shared))
     for scenario in alone:
         one(scenario)
+    op.stop_log_capture()
     threading.current_thread().name = "MainThread"
     return [results[s.id] for s in scenarios if s.id in results]

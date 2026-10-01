@@ -62,6 +62,9 @@ class K3dCluster:
             "--k3s-arg", "--kube-apiserver-arg=audit-policy-file=/etc/chaosmonkey/audit-policy.yaml@server:0",
             "--k3s-arg", f"--kube-apiserver-arg=audit-log-path={AUDIT_LOG}@server:0",
             "--k3s-arg", "--kube-apiserver-arg=audit-log-maxsize=500@server:0",
+            # operator logs are evidence; the default 10 MiB rotation loses them under trace logging
+            "--k3s-arg", "--kubelet-arg=container-log-max-size=200Mi@server:*",
+            "--k3s-arg", "--kubelet-arg=container-log-max-size=200Mi@agent:*",
             "--k3s-arg", "--disable=traefik@server:0",
             "--k3s-arg", "--disable=metrics-server@server:0",
         ]

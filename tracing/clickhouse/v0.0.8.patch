@@ -1,0 +1,622 @@
+diff --git a/internal/controller/chaostrace.go b/internal/controller/chaostrace.go
+new file mode 100644
+index 0000000..85837cd
+--- /dev/null
++++ b/internal/controller/chaostrace.go
+@@ -0,0 +1,59 @@
++package controller
++
++import (
++	"fmt"
++
++	"sigs.k8s.io/controller-runtime/pkg/client"
++	"sigs.k8s.io/controller-runtime/pkg/event"
++	"sigs.k8s.io/controller-runtime/pkg/predicate"
++
++	util "github.com/ClickHouse/clickhouse-operator/internal/controllerutil"
++)
++
++// TraceEventFilter wraps a controller-wide event filter and logs each watch event with the filter verdict.
++// The returned predicate returns exactly what the wrapped predicate returns.
++func TraceEventFilter(log util.Logger, controllerName string, inner predicate.Predicate) predicate.Predicate {
++	trace := func(eventType string, obj client.Object, passed bool) {
++		if obj == nil {
++			return
++		}
++
++		log.Info("CHAOSTRACE watch-event",
++			"controller", controllerName,
++			"event", eventType,
++			"kind", fmt.Sprintf("%T", obj),
++			"object_namespace", obj.GetNamespace(),
++			"object_name", obj.GetName(),
++			"resource_version", obj.GetResourceVersion(),
++			"deleting", !obj.GetDeletionTimestamp().IsZero(),
++			"passed", passed,
++		)
++	}
++
++	return predicate.Funcs{
++		CreateFunc: func(e event.CreateEvent) bool {
++			passed := inner.Create(e)
++			trace("create", e.Object, passed)
++
++			return passed
++		},
++		UpdateFunc: func(e event.UpdateEvent) bool {
++			passed := inner.Update(e)
++			trace("update", e.ObjectNew, passed)
++
++			return passed
++		},
++		DeleteFunc: func(e event.DeleteEvent) bool {
++			passed := inner.Delete(e)
++			trace("delete", e.Object, passed)
++
++			return passed
++		},
++		GenericFunc: func(e event.GenericEvent) bool {
++			passed := inner.Generic(e)
++			trace("generic", e.Object, passed)
++
++			return passed
++		},
++	}
++}
+diff --git a/internal/controller/clickhouse/commands.go b/internal/controller/clickhouse/commands.go
+index 409602c..ab0979c 100644
+--- a/internal/controller/clickhouse/commands.go
++++ b/internal/controller/clickhouse/commands.go
+@@ -334,6 +334,8 @@ func (cmd *commander) SyncShard(ctx context.Context, log controllerutil.Logger,
+ 
+ 	results := controllerutil.ExecuteParallel(replicasToSync, func(id v1.ClickHouseReplicaID) (v1.ClickHouseReplicaID, struct{}, error) {
+ 		errs := cmd.SyncReplica(ctx, log.With("replica_id", id), id)
++		log.Info("CHAOSTRACE shard-sync-replica", "replica_id", id.String(), "errors", len(errs), "error", fmt.Sprint(errors.Join(errs...)))
++
+ 		if len(errs) > 0 {
+ 			return id, struct{}{}, fmt.Errorf("sync replica %s: %w", id, errors.Join(errs...))
+ 		}
+@@ -433,8 +435,13 @@ func (cmd *commander) CleanupDatabaseReplicas(
+ 
+ 	log = log.With("replica_id", id)
+ 
++	log.Info("CHAOSTRACE db-replica-cleanup-start", "executor", id.String(), "query", "clusterAllReplicas(default, system.clusters) database_replica_name",
++		"shard_id_ge", cmd.cluster.Shards(), "replica_id_ge", cmd.cluster.Replicas(), "running_replicas", len(running))
++
+ 	rows, err := conn.Query(ctx, listStaleDatabaseReplicasQuery, cmd.cluster.Shards(), cmd.cluster.Replicas())
+ 	if err != nil {
++		log.Info("CHAOSTRACE db-replica-cleanup-end", "ok", false, "error", err.Error())
++
+ 		return fmt.Errorf("query stale database replicas %v: %w", id, err)
+ 	}
+ 
+@@ -461,11 +468,17 @@ func (cmd *commander) CleanupDatabaseReplicas(
+ 
+ 		if _, ok := running[toDrop]; ok {
+ 			log.Debug("skipping stale database replica cleanup that is still running", "database", database, "replica_id", toDrop)
++			log.Info("CHAOSTRACE db-replica-cleanup-row", "database", database, "stale_replica", toDrop.String(),
++				"is_active", isActive, "action", "skip-still-running")
++
+ 			continue
+ 		}
+ 
+ 		if isActive {
+ 			log.Debug("stale database replica is still active, skipping", "database", database, "replica_id", toDrop)
++			log.Info("CHAOSTRACE db-replica-cleanup-row", "database", database, "stale_replica", toDrop.String(),
++				"is_active", isActive, "action", "skip-active")
++
+ 			continue
+ 		}
+ 
+@@ -473,6 +486,11 @@ func (cmd *commander) CleanupDatabaseReplicas(
+ 
+ 		// Both parameters don't support query parameters, and arg binding doesn't support identifiers
+ 		err = conn.Exec(ctx, fmt.Sprintf("SYSTEM DROP DATABASE REPLICA '%d|%d' FROM DATABASE `%s`", toDrop.ShardID, toDrop.Index, database))
++		log.Info("CHAOSTRACE db-replica-cleanup-row", "database", database, "stale_replica", toDrop.String(),
++			"is_active", isActive, "action", "drop-database-replica",
++			"statement", fmt.Sprintf("SYSTEM DROP DATABASE REPLICA '%d|%d' FROM DATABASE `%s`", toDrop.ShardID, toDrop.Index, database),
++			"ok", err == nil, "error", fmt.Sprint(err))
++
+ 		if err != nil {
+ 			log.Info("failed to drop stale database replica", "replica_id", toDrop, "error", err)
+ 			continue
+@@ -481,6 +499,9 @@ func (cmd *commander) CleanupDatabaseReplicas(
+ 		succeed++
+ 	}
+ 
++	log.Info("CHAOSTRACE db-replica-cleanup-end", "rows", total, "dropped", succeed,
++		"row_error", fmt.Sprint(rows.Err()), "table_level_drop_replica_issued", false)
++
+ 	if err := rows.Err(); err != nil {
+ 		if succeed > 0 {
+ 			return fmt.Errorf("some stale replicas were cleaned up (%d/%d) but failed to fetch all stale database replica rows: %w", succeed, total, err)
+@@ -522,6 +543,7 @@ func (cmd *commander) createDatabase(
+ 	}
+ 
+ 	log.Warn("dropping stale replica metadata from Keeper", "replica_id", id, "database", database)
++	log.Info("CHAOSTRACE replica-already-exists", "replica_id", id.String(), "database", database, "error", err.Error())
+ 
+ 	if dropErr := cmd.dropStaleReplicaMetadata(ctx, id, database); dropErr != nil {
+ 		return fmt.Errorf("drop stale metadata of database %s: %w", database, dropErr)
+@@ -541,6 +563,8 @@ func (cmd *commander) createDatabase(
+ func (cmd *commander) dropStaleReplicaMetadata(ctx context.Context, id v1.ClickHouseReplicaID, database string) error {
+ 	peer, conn, err := cmd.shardPeerConn(ctx, id)
+ 	if err != nil {
++		cmd.log.Info("CHAOSTRACE stale-metadata-drop", "replica_id", id.String(), "database", database, "ok", false, "error", err.Error())
++
+ 		return err
+ 	}
+ 
+@@ -549,7 +573,11 @@ func (cmd *commander) dropStaleReplicaMetadata(ctx context.Context, id v1.ClickH
+ 		fmt.Sprintf("SYSTEM DROP DATABASE REPLICA '%d|%d' FROM DATABASE `%s`", id.ShardID, id.Index, database),
+ 		fmt.Sprintf("SYSTEM DROP REPLICA '%d' FROM DATABASE `%s`", id.Index, database),
+ 	} {
+-		if err := conn.Exec(ctx, query); err != nil {
++		err := conn.Exec(ctx, query)
++		cmd.log.Info("CHAOSTRACE stale-metadata-drop", "replica_id", id.String(), "peer", peer.String(), "database", database,
++			"statement", query, "ok", err == nil, "error", fmt.Sprint(err))
++
++		if err != nil {
+ 			return fmt.Errorf("on peer %s: %w", peer, err)
+ 		}
+ 	}
+diff --git a/internal/controller/clickhouse/controller.go b/internal/controller/clickhouse/controller.go
+index 808ab43..7c69696 100644
+--- a/internal/controller/clickhouse/controller.go
++++ b/internal/controller/clickhouse/controller.go
+@@ -84,6 +84,8 @@ func (cc *ClusterController) Reconcile(ctx context.Context, req ctrl.Request) (c
+ 	}
+ 
+ 	logger := cc.Logger.WithContext(ctx, cluster)
++	logger.Info("CHAOSTRACE reconcile-start", "request", req.String(), "generation", cluster.Generation,
++		"observed_generation", cluster.Status.ObservedGeneration, "resource_version", cluster.ResourceVersion)
+ 
+ 	if !cluster.DeletionTimestamp.IsZero() {
+ 		logger.Info("clickhouse cluster is being deleted, skipping reconcile")
+@@ -220,7 +222,7 @@ func SetupWithManager(mgr ctrl.Manager, deps chctrl.Dependencies, settings chctr
+ 	}
+ 
+ 	err := controllerBuilder.
+-		WithEventFilter(predicate.ResourceVersionChangedPredicate{}).
++		WithEventFilter(chctrl.TraceEventFilter(namedLogger, "clickhouse", predicate.ResourceVersionChangedPredicate{})).
+ 		Complete(clickhouseController)
+ 	if err != nil {
+ 		return fmt.Errorf("setup ClickHouse controller: %w", err)
+diff --git a/internal/controller/clickhouse/sync.go b/internal/controller/clickhouse/sync.go
+index 37ee819..45eb8b8 100644
+--- a/internal/controller/clickhouse/sync.go
++++ b/internal/controller/clickhouse/sync.go
+@@ -192,6 +192,7 @@ func (r *clickhouseReconciler) sync(ctx context.Context, log ctrlutil.Logger) (c
+ 	result, err := chctrl.RunSteps(ctx, log, steps)
+ 	if err != nil {
+ 		log.Error(err, "unexpected error, setting conditions to unknown and rescheduling reconciliation to try again")
++		log.Info("CHAOSTRACE reconcile-end", "requeue_after", "error-backoff", "error", err.Error())
+ 
+ 		r.SetCondition(metav1.Condition{
+ 			Type:    v1.ConditionTypeReconcileSucceeded,
+@@ -225,6 +226,19 @@ func (r *clickhouseReconciler) sync(ctx context.Context, log ctrlutil.Logger) (c
+ 		result.RequeueAfter = r.ResyncPeriod
+ 	}
+ 
++	{
++		configSync := meta.FindStatusCondition(r.Cluster.Status.Conditions, v1.ConditionTypeConfigurationInSync)
++		configSyncStatus, configSyncReason := "", ""
++		if configSync != nil {
++			configSyncStatus, configSyncReason = string(configSync.Status), configSync.Reason
++		}
++
++		log.Info("CHAOSTRACE reconcile-end", "requeue_after", result.RequeueAfter.String(),
++			"config_in_sync", configSyncStatus, "config_in_sync_reason", configSyncReason,
++			"current_revision", r.Cluster.Status.CurrentRevision, "update_revision", r.Cluster.Status.UpdateRevision,
++			"revision_in_sync", r.Cluster.Status.CurrentRevision == r.Cluster.Status.UpdateRevision)
++	}
++
+ 	return result, nil
+ }
+ 
+@@ -542,11 +556,21 @@ func (r *clickhouseReconciler) reconcileActiveReplicaStatus(ctx context.Context,
+ 			if err != nil {
+ 				log.Debug("failed to probe replica", "replica_id", id, "error", err)
+ 			} else if cfg, ok := configMaps[id]; ok && !probe.Reloaded(cfg.Annotations[ctrlutil.AnnotationReloadableConfigHash]) {
++				prevReload, prevUsersReload := probe.ReloadConfigRevision, probe.UsersReloadConfigRevision
++
+ 				if reloadErr = r.commander.ReloadConfig(ctx, id); reloadErr != nil {
+ 					log.Debug("replica config reload failed", "replica_id", id, "error", reloadErr)
+ 				} else if probe, err = r.commander.Probe(ctx, id); err != nil {
+ 					log.Debug("failed to re-probe replica after reload", "replica_id", id, "error", err)
+ 				}
++
++				log.Info("CHAOSTRACE config-reload", "replica_id", id.String(),
++					"configmap_reload_hash", cfg.Annotations[ctrlutil.AnnotationReloadableConfigHash],
++					"before_reload_rev", prevReload, "before_users_reload_rev", prevUsersReload,
++					"after_reload_rev", probe.ReloadConfigRevision, "after_users_reload_rev", probe.UsersReloadConfigRevision,
++					"reload_error", fmt.Sprint(reloadErr), "reprobe_error", fmt.Sprint(err))
++			} else if !ok {
++				log.Info("CHAOSTRACE config-reload", "replica_id", id.String(), "action", "skip-no-configmap")
+ 			}
+ 		}
+ 
+@@ -729,6 +753,27 @@ func (r *clickhouseReconciler) reconcileClusterRevisions(ctx context.Context, lo
+ 		r.Cluster.Status.CurrentRevision = r.Cluster.Status.UpdateRevision
+ 	}
+ 
++	{
++		for shard := range r.Cluster.Shards() {
++			for index := range r.Cluster.Replicas() {
++				id := v1.ClickHouseReplicaID{ShardID: shard, Index: index}
++				replica := r.ReplicaState[id]
++				if !replica.HasDiff(r.revs) && replica.StatefulSetUpdated() && replica.ReloadError == nil && replica.Reloaded(r.revs.ReloadConfigRevision) {
++					continue
++				}
++
++				log.Info("CHAOSTRACE config-sync-replica", append([]any{"replica_id", id.String()}, chaosReplicaDiff(replica, r.revs)...)...)
++			}
++		}
++
++		cond := chctrl.ConfigSyncCondition(reloadErr, notUpdated, notReloaded)
++		log.Info("CHAOSTRACE config-sync", "status", string(cond.Status), "reason", cond.Reason,
++			"not_updated", notUpdated, "reload_error", reloadErr, "not_reloaded", notReloaded,
++			"replica_states", exists, "expected_replicas", expected,
++			"current_revision_advanced", r.Cluster.Status.CurrentRevision == r.Cluster.Status.UpdateRevision,
++			"current_revision", r.Cluster.Status.CurrentRevision, "update_revision", r.Cluster.Status.UpdateRevision)
++	}
++
+ 	replicaVersions := make(map[string]string, len(r.ReplicaState))
+ 	for id, replica := range r.ReplicaState {
+ 		replicaVersions[id.String()] = replica.Version
+@@ -800,6 +845,9 @@ func (r *clickhouseReconciler) reconcileReplicaResources(ctx context.Context, lo
+ 		log.Info(fmt.Sprintf("updating replicas with priority %s: %v", highestStage.String(), replicasInStatus))
+ 	}
+ 
++	log.Info("CHAOSTRACE replica-rollout", "stage", highestStage.String(), "replicas", fmt.Sprint(replicasInStatus),
++		"requeue_after", requeueAfter.String())
++
+ 	for _, id := range replicasInStatus {
+ 		replicaResult, err := r.updateReplica(ctx, log, id)
+ 		if err != nil {
+@@ -828,6 +876,9 @@ func (r *clickhouseReconciler) reconcileDatabaseSync(ctx context.Context, log ct
+ 		}
+ 
+ 		result := chctrl.StepContinue()
++
++		log.Info("CHAOSTRACE database-sync", "sync_enabled", false, "initialization_candidates", fmt.Sprint(ids))
++
+ 		if !r.initializeReplicas(ctx, log, ids) {
+ 			result = chctrl.StepRequeue(chctrl.RequeueProbePoll)
+ 		}
+@@ -905,6 +956,11 @@ func (r *clickhouseReconciler) reconcileDatabaseSync(ctx context.Context, log ct
+ 		log.Info("no replicas to replicate schema, skipping")
+ 	}
+ 
++	log.Info("CHAOSTRACE database-sync", "reachable_replicas", fmt.Sprint(r.reachableReplicas),
++		"replica_states", len(r.ReplicaState), "schema_synced", schemaSynced, "all_databases_synced", allDatabasesSynced,
++		"default_db_ok", allReplicasInitialized, "non_replicated_default_db", nonReplicatedDefaultDatabaseIDs,
++		"initialization_candidates", fmt.Sprint(initializationCandidates), "will_initialize", schemaSynced)
++
+ 	if schemaSynced && !r.initializeReplicas(ctx, log, initializationCandidates) {
+ 		allReplicasInitialized = false
+ 	}
+@@ -916,6 +972,7 @@ func (r *clickhouseReconciler) reconcileDatabaseSync(ctx context.Context, log ct
+ 		cleanupCtx, cancel := context.WithTimeout(ctx, databaseOpsTimeout)
+ 		if err := r.commander.CleanupDatabaseReplicas(cleanupCtx, log, runningReplicas); err != nil {
+ 			log.Warn("failed to cleanup database replicas", "error", err)
++			log.Info("CHAOSTRACE db-replica-cleanup-result", "ok", false, "error", err.Error())
+ 
+ 			staleReplicasCleanedUp = false
+ 		}
+@@ -992,9 +1049,14 @@ func (r *clickhouseReconciler) initializeReplicas(ctx context.Context, log ctrlu
+ 			Reason:             v1.ReplicaInitializedReason,
+ 			Message:            "Replica initialization completed",
+ 		}); err != nil {
++			log.Info("CHAOSTRACE readiness-gate-set", "replica_id", id.String(), "pod", state.Pod.Name, "ok", false, "error", err.Error())
++
+ 			return id, struct{}{}, fmt.Errorf("update Pod status with initialized condition: %w", err)
+ 		}
+ 
++		log.Info("CHAOSTRACE readiness-gate-set", "replica_id", id.String(), "pod", state.Pod.Name, "ok", true,
++			"condition", string(v1.ReplicaInitializedCondition), "pod_ready_before", chctrl.PodConditionTrue(state.Pod, corev1.PodReady))
++
+ 		return id, struct{}{}, nil
+ 	})
+ 
+@@ -1033,6 +1095,9 @@ func (r *clickhouseReconciler) unloadRemovedReplicas(ctx context.Context, log ct
+ 		return drainingShards
+ 	}
+ 
++	log.Info("CHAOSTRACE scale-down-removed", "removed_replicas", fmt.Sprint(removedReplicas),
++		"gate_to_clear", fmt.Sprint(replicasToDrain), "shards", r.Cluster.Shards(), "replicas", r.Cluster.Replicas())
++
+ 	drainRes := ctrlutil.ExecuteParallel(replicasToDrain, func(id v1.ClickHouseReplicaID) (v1.ClickHouseReplicaID, struct{}, error) {
+ 		if err := r.UpdatePodCondition(ctx, r.ReplicaState[id].Pod, corev1.PodCondition{
+ 			Type:               v1.ReplicaInitializedCondition,
+@@ -1047,6 +1112,8 @@ func (r *clickhouseReconciler) unloadRemovedReplicas(ctx context.Context, log ct
+ 		return id, struct{}{}, nil
+ 	})
+ 	for id, res := range drainRes {
++		log.Info("CHAOSTRACE readiness-gate-cleared", "replica_id", id.String(), "ok", res.Err == nil, "error", fmt.Sprint(res.Err))
++
+ 		if res.Err != nil {
+ 			log.Info("failed to unload client traffic from replica scheduled for deletion", "replica_id", id, "error", res.Err)
+ 
+@@ -1079,6 +1146,9 @@ func (r *clickhouseReconciler) syncShardsPendingRemoval(ctx context.Context, log
+ 			continue
+ 		}
+ 
++		log.Info("CHAOSTRACE scale-down-sync-plan", "replica_id", id.String(), "shard_draining", drainingShards[id.ShardID],
++			"whole_shard_removed", id.ShardID >= r.Cluster.Shards(), "shard_has_reachable_replica", shardHasReachableReplica[id.ShardID])
++
+ 		switch {
+ 		case drainingShards[id.ShardID]:
+ 			log.Debug("replica scheduled for deletion is still serving client traffic, delaying sync", "shard", id.ShardID)
+@@ -1103,6 +1173,8 @@ func (r *clickhouseReconciler) syncShardsPendingRemoval(ctx context.Context, log
+ 	})
+ 
+ 	for id, res := range syncRes {
++		log.Info("CHAOSTRACE scale-down-shard-sync", "shard_id", id, "ok", res.Err == nil, "error", fmt.Sprint(res.Err))
++
+ 		if res.Err != nil {
+ 			log.Info("failed to sync shard", "shard_id", id, "error", res.Err)
+ 			r.unsyncedShards[id] = true
+@@ -1174,6 +1246,21 @@ func (r *clickhouseReconciler) reconcileCleanUp(ctx context.Context, log ctrluti
+ 	for id, res := range replicasToRemove {
+ 		inSync := !r.unsyncedShards[id.ShardID]
+ 
++		{
++			var retainedPVCs []string
++			if res.STS != nil {
++				if pvcs, pvcErr := r.GetReplicaPVCs(ctx, res.STS); pvcErr == nil {
++					for _, pvc := range pvcs {
++						retainedPVCs = append(retainedPVCs, pvc.Name)
++					}
++				}
++			}
++
++			log.Info("CHAOSTRACE replica-cleanup", "replica_id", id.String(), "shard_in_sync", inSync,
++				"skip", res.STS != nil && !inSync, "delete_configmap", res.CFG != nil, "delete_statefulset", res.STS != nil,
++				"delete_service", res.Service != nil, "pvcs_deleted", false, "pvcs_left", retainedPVCs)
++		}
++
+ 		// Delete StatefulSets only after the shard unloaded client traffic and synced surviving replicas.
+ 		if res.STS != nil && !inSync {
+ 			log.Info("shard sync failed, skipping replica deletion", "replica_id", id)
+@@ -1326,6 +1413,18 @@ func (r *clickhouseReconciler) updateReplica(ctx context.Context, log ctrlutil.L
+ 
+ 	replica := r.ReplicaState[id]
+ 
++	if replica.STS == nil {
++		var foundPVCs []string
++		if pvcs, pvcErr := r.GetReplicaPVCs(ctx, statefulSet); pvcErr == nil {
++			for _, pvc := range pvcs {
++				foundPVCs = append(foundPVCs, pvc.Name+"@"+pvc.CreationTimestamp.UTC().Format(time.RFC3339))
++			}
++		}
++
++		log.Info("CHAOSTRACE replica-create", "statefulset", statefulSet.Name, "existing_pvcs", foundPVCs,
++			"pvc_reused", len(foundPVCs) > 0)
++	}
++
+ 	result, err := r.ReconcileReplicaResources(ctx, log, chctrl.ReplicaUpdateInput{
+ 		Revisions: r.revs,
+ 		Existing:  replica.ReplicaState,
+@@ -1341,3 +1440,50 @@ func (r *clickhouseReconciler) updateReplica(ctx context.Context, log ctrlutil.L
+ 
+ 	return result, nil
+ }
++
++func chaosReplicaDiff(replica replicaState, revs chctrl.RevisionState) []any {
++	kv := []any{
++		"has_diff", replica.HasDiff(revs),
++		"sts_updated", replica.StatefulSetUpdated(),
++		"reloaded", replica.Reloaded(revs.ReloadConfigRevision),
++		"reload_error", fmt.Sprint(replica.ReloadError),
++		"queryable", replica.Queryable(),
++		"ready", replica.Ready(),
++		"probe_reload_rev", replica.ReloadConfigRevision,
++		"probe_users_reload_rev", replica.UsersReloadConfigRevision,
++		"desired_reload_rev", revs.ReloadConfigRevision,
++	}
++
++	if replica.STS == nil {
++		return append(kv, "sts_exists", false)
++	}
++
++	kv = append(kv,
++		"sts_spec_hash_match", ctrlutil.GetSpecHashFromObject(replica.STS) == revs.StatefulSetRevision,
++		"sts_restart_hash_match", replica.STS.Spec.Template.Annotations[ctrlutil.AnnotationConfigHash] == revs.RestartConfigRevision,
++		"sts_generation", replica.STS.Generation,
++		"sts_observed_generation", replica.STS.Status.ObservedGeneration,
++		"sts_current_revision", replica.STS.Status.CurrentRevision,
++		"sts_update_revision", replica.STS.Status.UpdateRevision,
++		"configmap_exists", replica.CFG != nil,
++	)
++
++	if replica.CFG != nil {
++		kv = append(kv,
++			"configmap_hash_match", ctrlutil.GetConfigHashFromObject(replica.CFG) == revs.ConfigurationRevision,
++			"configmap_reload_hash", replica.CFG.Annotations[ctrlutil.AnnotationReloadableConfigHash],
++		)
++	}
++
++	var pvcMismatch []string
++	for name, revision := range revs.PVCRevisions {
++		pvc, ok := replica.PVCs[name]
++		if !ok || pvc == nil {
++			pvcMismatch = append(pvcMismatch, name+":missing")
++		} else if ctrlutil.GetSpecHashFromObject(pvc) != revision {
++			pvcMismatch = append(pvcMismatch, name+":spec-hash")
++		}
++	}
++
++	return append(kv, "pvc_mismatch", pvcMismatch)
++}
+diff --git a/internal/controller/keeper/controller.go b/internal/controller/keeper/controller.go
+index 261dd8f..8c131c9 100644
+--- a/internal/controller/keeper/controller.go
++++ b/internal/controller/keeper/controller.go
+@@ -69,6 +69,8 @@ func (cc *ClusterController) Reconcile(ctx context.Context, req ctrl.Request) (c
+ 	}
+ 
+ 	logger := cc.Logger.WithContext(ctx, cluster)
++	logger.Info("CHAOSTRACE reconcile-start", "request", req.String(), "generation", cluster.Generation,
++		"observed_generation", cluster.Status.ObservedGeneration, "resource_version", cluster.ResourceVersion)
+ 
+ 	if !cluster.DeletionTimestamp.IsZero() {
+ 		logger.Info("keeper cluster is being deleted, skipping reconcile")
+@@ -199,7 +201,7 @@ func SetupWithManager(mgr ctrl.Manager, deps chctrl.Dependencies, settings chctr
+ 	}
+ 
+ 	err := controllerBuilder.
+-		WithEventFilter(predicate.ResourceVersionChangedPredicate{}).
++		WithEventFilter(chctrl.TraceEventFilter(namedLogger, "keeper", predicate.ResourceVersionChangedPredicate{})).
+ 		Complete(keeperController)
+ 	if err != nil {
+ 		return fmt.Errorf("setup Keeper controller: %w", err)
+diff --git a/internal/controller/keeper/sync.go b/internal/controller/keeper/sync.go
+index e1e4e3b..ebfb287 100644
+--- a/internal/controller/keeper/sync.go
++++ b/internal/controller/keeper/sync.go
+@@ -146,6 +146,7 @@ func (r *keeperReconciler) sync(ctx context.Context, log ctrlutil.Logger) (ctrl.
+ 	result, err := chctrl.RunSteps(ctx, log, steps)
+ 	if err != nil {
+ 		log.Error(err, "unexpected error, setting conditions to unknown and rescheduling reconciliation to try again")
++		log.Info("CHAOSTRACE reconcile-end", "requeue_after", "error-backoff", "error", err.Error())
+ 
+ 		r.SetCondition(metav1.Condition{Type: v1.ConditionTypeReconcileSucceeded, Status: metav1.ConditionFalse, Reason: v1.ConditionReasonStepFailed, Message: "Reconcile returned error"})
+ 
+@@ -169,6 +170,9 @@ func (r *keeperReconciler) sync(ctx context.Context, log ctrlutil.Logger) (ctrl.
+ 		result.RequeueAfter = r.ResyncPeriod
+ 	}
+ 
++	log.Info("CHAOSTRACE reconcile-end", "requeue_after", result.RequeueAfter.String(),
++		"current_revision", r.Cluster.Status.CurrentRevision, "update_revision", r.Cluster.Status.UpdateRevision)
++
+ 	return result, nil
+ }
+ 
+@@ -302,6 +306,17 @@ func (r *keeperReconciler) reconcileActiveReplicaStatus(ctx context.Context, log
+ 		}
+ 	}
+ 
++	for id, state := range r.ReplicaState {
++		stsReady := int32(-1)
++		if state.STS != nil {
++			stsReady = state.STS.Status.ReadyReplicas
++		}
++
++		log.Info("CHAOSTRACE keeper-replica-status", "replica_id", int(id), "server_state", state.Status.ServerState,
++			"followers", state.Status.Followers, "sts_ready_replicas", stsReady, "has_diff", state.HasDiff(r.revs),
++			"ready", state.Ready(len(r.ReplicaState)))
++	}
++
+ 	if err := r.checkHorizontalScalingAllowed(ctx, log); err != nil {
+ 		return chctrl.StepResult{}, err
+ 	}
+@@ -384,6 +399,7 @@ func (r *keeperReconciler) reconcileQuorumMembership(_ context.Context, log ctrl
+ 	// For running cluster, allow quorum membership changes only in stable state.
+ 	if !r.HorizontalScaleAllowed {
+ 		log.Info("Delaying horizontal scaling, cluster is not in stable state")
++		log.Info("CHAOSTRACE keeper-quorum-change", "action", "delay", "active_replicas", activeReplicas, "requested_replicas", requestedReplicas)
+ 		return chctrl.StepRequeue(chctrl.RequeueProbePoll), nil
+ 	}
+ 
+@@ -392,6 +408,8 @@ func (r *keeperReconciler) reconcileQuorumMembership(_ context.Context, log ctrl
+ 		for id := v1.KeeperReplicaID(1); ; id++ {
+ 			if _, ok := r.ReplicaState[id]; !ok {
+ 				log.Info("creating new replica", "replica_id", id)
++				log.Info("CHAOSTRACE keeper-quorum-change", "action", "add", "replica_id", int(id),
++					"active_replicas", activeReplicas, "requested_replicas", requestedReplicas)
+ 				r.GetRecorder().Eventf(r.Cluster, nil, corev1.EventTypeNormal, v1.EventReasonReplicaCreated,
+ 					v1.EventActionScaling, "Adding new replica %q to the cluster", r.Cluster.HostnameByID(id))
+ 				r.ReplicaState[id] = replicaState{}
+@@ -415,6 +433,9 @@ func (r *keeperReconciler) reconcileQuorumMembership(_ context.Context, log ctrl
+ 		}
+ 
+ 		log.Info("deleting replica", "replica_id", chosenIndex)
++		log.Info("CHAOSTRACE keeper-quorum-change", "action", "remove", "replica_id", int(chosenIndex),
++			"server_state", r.ReplicaState[chosenIndex].Status.ServerState,
++			"active_replicas", activeReplicas, "requested_replicas", requestedReplicas)
+ 		r.GetRecorder().Eventf(r.Cluster, nil, corev1.EventTypeNormal, v1.EventReasonReplicaDeleted, v1.EventActionScaling,
+ 			"Deleting replica %q from the cluster", r.Cluster.HostnameByID(chosenIndex))
+ 		delete(r.ReplicaState, chosenIndex)
+@@ -546,6 +567,15 @@ func (r *keeperReconciler) reconcileReplicaResources(ctx context.Context, log ct
+ 		log.Info(fmt.Sprintf("updating replicas with priority %s: %v", highestStage.String(), replicasInStatus))
+ 	}
+ 
++	{
++		roles := make([]string, 0, len(replicasInStatus))
++		for _, id := range replicasInStatus {
++			roles = append(roles, fmt.Sprintf("%d:%s", id, r.ReplicaState[id].Status.ServerState))
++		}
++
++		log.Info("CHAOSTRACE keeper-rollout", "stage", highestStage.String(), "replicas", roles, "requeue_after", requeueAfter.String())
++	}
++
+ 	for _, id := range replicasInStatus {
+ 		replicaResult, err := r.updateReplica(ctx, log, id)
+ 		if err != nil {
+@@ -841,7 +871,7 @@ func (r *keeperReconciler) loadQuorumReplicas(ctx context.Context) (map[v1.Keepe
+ 	return replicas, nil
+ }
+ 
+-func (r *keeperReconciler) checkHorizontalScalingAllowed(_ context.Context, _ ctrlutil.Logger) error {
++func (r *keeperReconciler) checkHorizontalScalingAllowed(_ context.Context, log ctrlutil.Logger) error {
+ 	var leader v1.KeeperReplicaID = -1
+ 
+ 	activeReplicas := len(r.ReplicaState)
+@@ -867,6 +897,9 @@ func (r *keeperReconciler) checkHorizontalScalingAllowed(_ context.Context, _ ct
+ 	scaleBlocked := func(conditionReason v1.ConditionReason, format string, formatArgs ...any) error {
+ 		r.HorizontalScaleAllowed = false
+ 
++		log.Info("CHAOSTRACE keeper-scale-allowed", "allowed", false, "reason", string(conditionReason),
++			"message", fmt.Sprintf(format, formatArgs...), "active_replicas", activeReplicas)
++
+ 		r.SetCondition(
+ 			metav1.Condition{
+ 				Type:    v1.KeeperConditionTypeScaleAllowed,
+@@ -942,5 +975,8 @@ func (r *keeperReconciler) checkHorizontalScalingAllowed(_ context.Context, _ ct
+ 		Message: "",
+ 	})
+ 
++	log.Info("CHAOSTRACE keeper-scale-allowed", "allowed", true, "leader", int(leader),
++		"active_replicas", activeReplicas, "updated_replicas", updatedReplicas, "ready_replicas", readyReplicas)
++
+ 	return nil
+ }
+diff --git a/internal/controller/resourcemanager.go b/internal/controller/resourcemanager.go
+index 6f6deb3..8bb5cf4 100644
+--- a/internal/controller/resourcemanager.go
++++ b/internal/controller/resourcemanager.go
+@@ -88,6 +88,8 @@ func (rm *ResourceManager) ReconcileResource(
+ 		}
+ 
+ 		log.Info("resource not found, creating")
++		log.Info("CHAOSTRACE resource-create", "kind", fmt.Sprintf("%T", resource), "resource", resource.GetName(),
++			"owner", rm.owner.GetName())
+ 
+ 		return true, rm.Create(ctx, resource, action)
+ 	}
+@@ -293,6 +295,7 @@ func (rm *ResourceManager) ReconcileReplicaResources(
+ 	for name, revision := range input.Revisions.PVCRevisions {
+ 		if err := rm.updatePVC(ctx, log, input.Existing.PVCs[name], input.Desired.PVCs[name], revision); err != nil {
+ 			log.Warn("failed to update replica PVC", "pvc", name, "error", err)
++			log.Info("CHAOSTRACE pvc-update", "disk", name, "result", "failed", "error", err.Error())
+ 		}
+ 	}
+ 
+@@ -304,6 +307,7 @@ func (rm *ResourceManager) ReconcileReplicaResources(
+ 
+ 	if input.Existing.STS == nil {
+ 		log.Info("replica StatefulSet not found, creating", "statefulset", statefulSet.Name)
++		log.Info("CHAOSTRACE sts-create", "statefulset", statefulSet.Name, "config_changed", configChanged)
+ 		util.AddSpecHashToObject(statefulSet, input.Revisions.StatefulSetRevision)
+ 
+ 		for i := range statefulSet.Spec.VolumeClaimTemplates {
+@@ -373,6 +377,8 @@ func (rm *ResourceManager) ReconcileReplicaResources(
+ 	}
+ 
+ 	log.Info("updating replica StatefulSet", "statefulset", statefulSet.Name)
++	log.Info("CHAOSTRACE sts-update", "statefulset", statefulSet.Name,
++		"existing_spec_hash", util.GetSpecHashFromObject(input.Existing.STS), "desired_spec_hash", input.Revisions.StatefulSetRevision)
+ 
+ 	updatedSTS := input.Existing.STS.DeepCopy()
+ 	updatedSTS.Spec = statefulSet.Spec

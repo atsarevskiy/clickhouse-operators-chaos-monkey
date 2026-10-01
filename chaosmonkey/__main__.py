@@ -27,14 +27,49 @@ def _run_one(target: dict, args: argparse.Namespace, out_root: Path) -> list:
     label = target.get("label", target["version"])
     out = out_root / f"{op.name}-{label}"
     chosen = scenarios.select(target.get("profile", args.profile), target.get("scenarios") or args.scenario)
-    if args.fresh_cluster and cluster.exists():
-        cluster.delete()
-    try:
-        results = run_target(op, cluster, chosen, _base_spec(args), out, env=target.get("env"),
-                             concurrency=args.concurrency)
-    finally:
-        if not args.keep_cluster:
+    if args.repeat > 1:
+        # Each repeat is its own scenario id ("node-drain#2"), so results sit side by side and a
+        # placement-dependent outcome shows up as a split verdict instead of a coin flip.
+        import copy
+        chosen = [copy.copy(s) for s in chosen for _ in range(args.repeat)]
+        seen: dict[str, int] = {}
+        for s in chosen:
+            seen[s.id] = seen.get(s.id, 0) + 1
+            s.id = f"{s.id}#{seen[s.id]}"
+    shards = max(1, args.clusters)
+    if shards == 1:
+        if args.fresh_cluster and cluster.exists():
             cluster.delete()
+        try:
+            results = run_target(op, cluster, chosen, _base_spec(args), out, env=target.get("env"),
+                                 concurrency=args.concurrency)
+        finally:
+            if not args.keep_cluster:
+                cluster.delete()
+    else:
+        # Spread the scenarios over several clusters, each with its own operator, so the ones that
+        # must run alone (operator kills, node faults, perf) run side by side on different clusters.
+        # Longest-first round robin keeps the groups roughly even.
+        est = {"performance": 9, "infrastructure": 5, "operator": 5, "metadata": 12, "spec": 7}
+        ordered = sorted(chosen, key=lambda s: -est.get(s.category, 4))
+        groups = [ordered[i::shards] for i in range(shards)]
+
+        def run_group(i: int) -> list:
+            c = K3dCluster(f"{cluster.name}-{i}", agents=args.agents)
+            o = adapter_cls(c, target["version"], image=target.get("image"))
+            if c.exists():
+                c.delete()
+            try:
+                return run_target(o, c, groups[i], _base_spec(args), out / f"cluster-{i}",
+                                  env=target.get("env"), concurrency=args.concurrency)
+            finally:
+                if not args.keep_cluster:
+                    c.delete()
+        with ThreadPoolExecutor(max_workers=shards) as pool:
+            parts = list(pool.map(run_group, range(shards)))
+        by_id = {r.scenario: r for part in parts for r in part}
+        results = [by_id[s.id] for s in chosen if s.id in by_id]
+        out.mkdir(parents=True, exist_ok=True)
     for r in results:
         r.version = label
     (out / "results.json").write_text(json.dumps([r.to_dict() for r in results], indent=1))
@@ -84,7 +119,8 @@ def cmd_report(args: argparse.Namespace) -> int:
     dirs = []
     for p in paths:
         dirs += sorted(x for x in p.iterdir() if x.is_dir()) if (p.is_dir() and not (p / "results.json").exists()) else [p]
-    print(report.scorecard(report.load(dirs)))
+    results = report.load(dirs)
+    print(report.readme_table(results) if args.readme_table else report.scorecard(results))
     return 0
 
 
@@ -114,6 +150,9 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("--out", default="results")
         sp.add_argument("--keep-cluster", action="store_true", help="leave the k3d cluster running afterwards")
         sp.add_argument("--fresh-cluster", action="store_true", help="delete an existing cluster of the same name first")
+        sp.add_argument("--repeat", type=int, default=1, help="run each selected scenario this many times")
+        sp.add_argument("--clusters", type=int, default=1,
+                        help="spread one operator's scenarios over this many k3d clusters (needs inotify headroom)")
         sp.add_argument("--concurrency", type=int, default=3,
                         help="namespace-local scenarios run this many at a time (1 = sequential)")
 
@@ -134,6 +173,8 @@ def main(argv: list[str] | None = None) -> int:
 
     rep = sub.add_parser("report", help="print a scorecard from one or more result directories")
     rep.add_argument("paths", nargs="+")
+    rep.add_argument("--readme-table", action="store_true",
+                     help="print the one-table summary with a plain-language column, for the README")
     rep.set_defaults(fn=cmd_report)
 
     ls = sub.add_parser("list", help="list scenarios, profiles and operators")
