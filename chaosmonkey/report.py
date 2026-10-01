@@ -214,6 +214,8 @@ def _happened(r: dict) -> str:
         return "not run: the trigger needs " + r.get("summary", "").split(": ", 1)[-1] + ", which this operator lacks"
     if r["verdict"] == "ERROR":
         return "harness error: " + _clean(r.get("summary", ""), 120)
+    if r["verdict"] == "INVALID":
+        return _clean(r.get("summary", ""), 160)
     grouped: dict[str, list[str]] = {}
     for f in r.get("findings", []):
         if f["severity"] in ("fail", "warn"):
@@ -313,7 +315,7 @@ def _timing_row(label: str, rs: list[dict]) -> list[str]:
 def summary_table(results: list[dict]) -> str:
     targets = sorted({(r["operator"], r["version"]) for r in results})
     cats = sorted({r["category"] for r in results})
-    head = ["Operator", "Correctness", "PASS", "DEGRADED", "FAIL", "SKIPPED"]
+    head = ["Operator", "Correctness", "PASS", "DEGRADED", "FAIL", "SKIPPED", "INVALID"]
     lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     per_target = {}
     for t in targets:
@@ -325,7 +327,7 @@ def summary_table(results: list[dict]) -> str:
             c[r["verdict"]] += 1
         lines.append("| " + " | ".join([
             f"{t[0]} {t[1]}", f"**{_fmt(_mean([v for _, v in cor.values()]))}/100**",
-            str(c["PASS"]), str(c["DEGRADED"]), str(c["FAIL"]), str(c["SKIPPED"])]) + " |")
+            str(c["PASS"]), str(c["DEGRADED"]), str(c["FAIL"]), str(c["SKIPPED"]), str(c["INVALID"])]) + " |")
     head = ["Operator", "Events", "Runs timed", "Mean s", "p50 s", "p90 s", "p99 s", "Max s", "Never healthy",
             "Client outage mean s", "Outage p90 s", "Outage max s"]
     lines += ["", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
@@ -368,7 +370,9 @@ def readme_table(results: list[dict]) -> str:
              "applied) until every pod is Ready and the change has reached every pod, one sample per run: "
              "`failures` are the scenarios that break something, `changes` the spec and performance ones. "
              "`Never healthy` counts runs with no time at all, which the percentiles leave out. Client outage "
-             "is the longest run of failed reads or writes during the run. PASS/DEGRADED/FAIL/SKIPPED count runs.", "",
+             "is the longest run of failed reads or writes during the run. INVALID runs happened while the host "
+             "was overloaded (OOM kills, load above 2 per CPU, or under 3 GB free) and are not scored. "
+             "PASS/DEGRADED/FAIL/SKIPPED/INVALID count runs.", "",
              "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     for s in order:
         runs = [index.get((o, v, s), []) for o, v in targets]

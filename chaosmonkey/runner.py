@@ -12,6 +12,7 @@ from collections import Counter
 from pathlib import Path
 
 from .cluster import K3dCluster
+from .host import monitor
 from .kube import now_rfc3339, pod_ready, wait_until
 from .model import ClusterSpec, ScenarioResult
 from .operators.base import OperatorAdapter
@@ -87,6 +88,10 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         result.verdict = "SKIPPED"
         result.summary = f"{op.name} lacks what the trigger needs: {', '.join(sorted(missing))}"
         return result
+    waited = monitor().wait_for_headroom()
+    if waited > 5:
+        _log(f"  waited {waited:.0f}s for host headroom")
+    started = time.time()
     try:
         cluster.import_images(sorted({spec.server_image, spec.keeper_image, *getattr(scenario, "images", [])}))
         drop_namespace(op, spec.namespace)
@@ -250,6 +255,12 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         return result
     finally:
         result.duration_s = round(time.time() - started, 1)
+        for k, v in monitor().window(started, time.time()).items():
+            result.measure(f"host_{k}", v, "")
+        overload = monitor().overload(started, time.time())
+        if overload and result.verdict != "SKIPPED":
+            result.verdict = "INVALID"
+            result.summary = f"host overloaded, not scored: {overload}"
         if ctx is not None:
             (out_dir / f"{scenario.id}.samples.json").write_text(json.dumps(ctx.samples, indent=1))
         # Only this scenario's window, and split per custom resource: one controller's reconcile
