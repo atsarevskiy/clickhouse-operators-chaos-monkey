@@ -66,6 +66,9 @@ class Scenario:
     #: touches something shared by every namespace (the operator, a node, cluster-wide API load),
     #: so it runs alone after the parallel batch
     exclusive: bool = False
+    #: compare the ingest stream batch by batch afterwards; off for scenarios that delete the cluster
+    #: on purpose, where every earlier batch is expected to be gone
+    stream_check: bool = True
 
     @property
     def runs_alone(self) -> bool:

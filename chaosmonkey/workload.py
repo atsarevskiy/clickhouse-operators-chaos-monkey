@@ -30,6 +30,9 @@ STREAM_BATCH = 100
 
 
 class Workload:
+    #: errors of a replicated table that is still starting up or waiting for its Keeper session
+    STARTING_UP = ("NOT_INITIALIZED", "TABLE_IS_READ_ONLY", "NO_ZOOKEEPER", "KEEPER_EXCEPTION")
+
     def __init__(self, op: OperatorAdapter, spec: ClusterSpec):
         self.op = op
         self.spec = spec
@@ -122,9 +125,16 @@ class Workload:
                 findings.append(Finding("fail", "workload write", f"shard {shard} has no Ready replica"))
                 continue
             start = self.next_id
-            rc, out = self.op.sql(self.spec, pod,
-                                  f"INSERT INTO {LOCAL} (id, shard) SELECT {start} + number, {shard} "
-                                  f"FROM numbers({rows_per_shard})")
+            query = f"INSERT INTO {LOCAL} (id, shard) SELECT {start} + number, {shard} FROM numbers({rows_per_shard})"
+            # After a restart with Keeper unreachable, replicated tables refuse writes for a while
+            # with the pod already Ready: ClickHouse's own startup, measured rather than judged.
+            t0 = time.time()
+            rc, out = self.op.sql(self.spec, pod, query)
+            while rc != 0 and any(c in out for c in self.STARTING_UP) and time.time() - t0 < 180:
+                time.sleep(3)
+                rc, out = self.op.sql(self.spec, pod, query)
+            if time.time() - t0 >= 3:
+                self.readonly_wait_s[pod] = max(self.readonly_wait_s.get(pod, 0), round(time.time() - t0))
             if rc != 0:
                 findings.append(Finding("fail", "workload write", f"shard {shard} via {pod}: {out.strip()[:300]}"))
                 continue
@@ -187,7 +197,11 @@ class Workload:
         ns, image = self.spec.namespace, self.spec.server_image
         svc = self.op.query_service(self.spec)
         user, pw = self.op.workload_user, self.op.workload_password
-        client = f"clickhouse-client -h {svc} --user {user} --password {pw} --connect_timeout 1 --receive_timeout 3 --send_timeout 3"
+        # The client Service is headless, and clickhouse-client given one name tries its addresses
+        # in DNS order, so every probe query would start on the same host and a fault anywhere
+        # else would be invisible. Each call gets every address, shuffled, as failover hosts.
+        targets = f"$(getent ahosts {svc} | awk '{{print $1}}' | sort -u | shuf | sed 's/^/--host /' | tr '\\n' ' ')"
+        client = f"clickhouse-client {targets} --user {user} --password {pw} --connect_timeout 1 --receive_timeout 3 --send_timeout 3"
         ms = "$(($(date +%s%N)/1000000))"
         query_loop = (
             "i=0; while true; do i=$((i+1)); "

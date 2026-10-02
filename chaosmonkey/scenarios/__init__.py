@@ -11,6 +11,7 @@ from .tracker import (DeletionWithoutOperator, ForegroundDeletion, KeeperRolling
                       KeeperStatefulSetDeleted, MigrationFailureMarkedDone, ReplicaServesBeforeSchema,
                       RestartDuringSlowStart, ScaleDownLeavesReplicaMetadata, ScaleDownShardLeavesMetadata,
                       StorageClassChange, StuckTerminatingPod, UnschedulableRollout)
+from .extended import EXTENDED
 from .failures import (AllServersKill, BadConfigRollout, ConfigMapsDeletedThenRestart, KeeperAllKill,
                        KeeperMemberKill, KeeperQuorumLoss, OperatorDownDuringFailure, OperatorKillIdle,
                        OperatorKillMidDriftRepair, OperatorKillMidRollout, PvcDeleted, ServerPodKill,
@@ -32,6 +33,7 @@ ALL: list[Scenario] = [
     DeletionWithoutOperator(), KeeperRollingRestart(), RestartDuringSlowStart(),
     # operator-neutral versions of the three capability-dependent scenarios
     StuckTerminatingPod(), UnschedulableRollout(), StorageClassChange(),
+    *EXTENDED,
 ]
 BY_ID = {s.id: s for s in ALL}
 
@@ -56,6 +58,7 @@ _TRACKER = [
 ]
 _FULL += _TRACKER
 _PERF = ["perf-rolling-restart", "perf-scale-out", "perf-operator-restart"]
+_EXTENDED = [s.id for s in EXTENDED]
 
 PROFILES: dict[str, list[str]] = {
     "smoke": _SMOKE,
@@ -63,7 +66,8 @@ PROFILES: dict[str, list[str]] = {
     "full": _FULL,
     "tracker": _TRACKER,
     "perf": _PERF,
-    "all": _FULL + _PERF,
+    "extended": _EXTENDED,
+    "all": _FULL + _PERF + _EXTENDED,
 }
 
 

@@ -131,3 +131,31 @@ class K3dCluster:
 
     def start_node(self, node: str) -> None:
         subprocess.run(["docker", "start", self.node_container(node)], capture_output=True)
+
+    def pause_node(self, node: str) -> None:
+        """Freeze every process on the node; the kubelet stops reporting and connections hang."""
+        subprocess.run(["docker", "pause", self.node_container(node)], capture_output=True)
+
+    def unpause_node(self, node: str) -> None:
+        subprocess.run(["docker", "unpause", self.node_container(node)], capture_output=True)
+
+    def restart_node(self, node: str, grace_s: int = 10) -> None:
+        subprocess.run(["docker", "restart", "-t", str(grace_s), self.node_container(node)], capture_output=True)
+
+    def signal_container(self, pod: dict, container: str, sig: str) -> bool:
+        """Send a signal to a container's main process from its node. From inside the container
+        the process is PID 1 of its namespace, and the kernel drops SIGKILL and SIGSTOP sent to it
+        from there, so `kill -9 1` in an exec does nothing. Matched by pod UID: scenarios running
+        side by side use the same pod names in different namespaces."""
+        node = pod["spec"]["nodeName"]
+        cid = subprocess.run(["docker", "exec", node, "crictl", "ps", "-q", "--state", "running",
+                              "--label", f"io.kubernetes.pod.uid={pod['metadata']['uid']}",
+                              "--label", f"io.kubernetes.container.name={container}"],
+                             capture_output=True, text=True).stdout.split()
+        if len(cid) != 1:
+            return False
+        pid = subprocess.run(["docker", "exec", node, "crictl", "inspect", "-o", "go-template",
+                              "--template", "{{.info.pid}}", cid[0]], capture_output=True, text=True).stdout.strip()
+        if not pid.isdigit():
+            return False
+        return subprocess.run(["docker", "exec", node, "kill", f"-{sig}", pid], capture_output=True).returncode == 0

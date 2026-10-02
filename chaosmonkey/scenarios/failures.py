@@ -36,6 +36,10 @@ def recreated_since_inject(ctx: Context) -> bool:
     return True
 
 
+def container_restarts(pod: dict) -> int:
+    return sum(c.get("restartCount", 0) for c in (pod.get("status") or {}).get("containerStatuses") or [])
+
+
 def _owner_statefulset(pod: dict) -> str | None:
     for ref in pod["metadata"].get("ownerReferences", []):
         if ref.get("kind") == "StatefulSet":
@@ -93,9 +97,19 @@ class ServerProcessCrash(Scenario):
             expect=Expectations(recover_slo_s=60))
 
     def inject(self, ctx: Context) -> None:
-        pod = _pick(ctx)["metadata"]["name"]
-        ctx.kube.exec(ctx.spec.namespace, pod, ctx.op.server_container, ["sh", "-c", "kill -9 1"], timeout=20)
-        ctx.notes["victim"] = pod
+        pod = _pick(ctx)
+        name = pod["metadata"]["name"]
+        ctx.notes["victim"], ctx.notes["restarts_before"] = name, container_restarts(pod)
+        if not ctx.cluster.signal_container(pod, ctx.op.server_container, "KILL"):
+            raise RuntimeError(f"could not signal the server process of {name}")
+
+    def verify(self, ctx: Context) -> None:
+        # the fault happened only if the container actually restarted
+        pod = ctx.kube.get("pod", ctx.notes["victim"], ctx.spec.namespace) or {}
+        restarts = container_restarts(pod) - ctx.notes["restarts_before"]
+        ctx.result.measure("victim_container_restarts", restarts, "count")
+        if restarts <= 0:
+            ctx.result.add("fail", "fault not applied", "the server container never restarted")
 
 
 class BadConfigRollout(Scenario):

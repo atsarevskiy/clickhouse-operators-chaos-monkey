@@ -58,6 +58,7 @@ def restore_infrastructure(op: OperatorAdapter, cluster: K3dCluster) -> None:
         if node["spec"].get("unschedulable"):
             op.kube.run("uncordon", name, check=False)
     for c in [f"k3d-{cluster.name}-agent-{i}" for i in range(cluster.agents)]:
+        cluster.unpause_node(c)
         cluster.start_node(c)
     wait_until(lambda: len(cluster.ready_nodes()) == cluster.agents + 1, timeout=180)
     if not op.operator_pods():
@@ -208,7 +209,7 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
                           ("read_p50_ms", "ms"), ("read_p99_ms", "ms"),
                           ("min_rows_per_10s", "rows"), ("median_rows_per_10s", "rows")):
             result.measure(f"stream_{key}", s[key], unit)
-        if exp.cluster_survives and ctx.recovered_at is not None:
+        if exp.cluster_survives and ctx.recovered_at is not None and scenario.stream_check:
             integrity, stream_findings = workload.stream_integrity()
             for key, value in integrity.items():
                 result.measure(f"stream_{key}", value, "count")
@@ -257,6 +258,10 @@ def run_scenario(op: OperatorAdapter, cluster: K3dCluster, scenario: Scenario, b
         result.measure("api_writes", sum(verbs[v] for v in ("create", "update", "patch", "delete")), "requests")
 
         result.decide()
+        missed = [f.detail for f in result.findings if f.check == "fault not applied"]
+        if missed:
+            # the scenario measured a cluster that was never broken, which says nothing about the operator
+            result.verdict, result.summary = "INVALID", f"fault not applied: {missed[0]}"
         return result
     except Exception as exc:  # noqa: BLE001 - one broken scenario must not stop the run
         result.verdict = "ERROR"
