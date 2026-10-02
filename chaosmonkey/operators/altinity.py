@@ -164,7 +164,7 @@ class AltinityOperator(OperatorAdapter):
                         f"{self.workload_user}/networks/ip": ["::/0"],
                         f"{self.workload_user}/profile": "default",
                     },
-                    "settings": spec.server_settings,
+                    "settings": {**spec.server_settings, **spec.reloadable_settings},
                     "clusters": [{"name": CLUSTER, "layout": {"shardsCount": spec.shards,
                                                               "replicasCount": spec.replicas}}],
                 },

@@ -37,6 +37,9 @@ class ClusterSpec:
     volume_variant: str = "a"
     volume_b_storage_class: str | None = None
     server_settings: dict[str, Any] = field(default_factory=dict)
+    # settings ClickHouse applies without a restart; an adapter puts them wherever its operator
+    # promises not to restart for them
+    reloadable_settings: dict[str, Any] = field(default_factory=dict)
     keeper_settings: dict[str, Any] = field(default_factory=dict)
 
     @property

@@ -172,6 +172,8 @@ class ClickHouseOperator(OperatorAdapter):
                 "dataVolumeClaimSpec": self._pvc(spec),
                 "settings": {
                     "extraConfig": _nested(spec.server_settings),
+                    # changes here don't restart replicas (spec.settings.extraReloadableConfig)
+                    **({"extraReloadableConfig": _nested(spec.reloadable_settings)} if spec.reloadable_settings else {}),
                     "extraUsersConfig": {"users": {self.workload_user: {
                         "password": self.workload_password, "networks": {"ip": "::/0"}, "profile": "default"}}},
                 },

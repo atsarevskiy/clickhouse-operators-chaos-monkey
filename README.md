@@ -146,19 +146,19 @@ preStop and volume-recreate scenarios are skipped for it.
 
 ## Results
 
-Altinity operator 0.27.4 and ClickHouse operator 0.0.8, ClickHouse and Keeper 26.8, 2 shards x 2 replicas plus 3 Keepers on a three-node k3d cluster with replicas and Keepers spread by each operator's own placement setting, all 88 scenarios, 2026-10-01 and 2026-10-02. No run was marked INVALID. Fourteen scenarios were rerun after the signal and startup-window fixes and one ClickHouse operator deletion scenario after its documented PVC retention was taken into account; those results replace the first run's. Regenerate with `python3 -m chaosmonkey report <run dirs...> --readme-table`.
+Altinity operator 0.27.4 and ClickHouse operator 0.0.8, ClickHouse and Keeper 26.8, 2 shards x 2 replicas plus 3 Keepers on a three-node k3d cluster with replicas and Keepers spread by each operator's own placement setting, all 88 scenarios, 2026-10-01 and 2026-10-02. No run was marked INVALID. Fourteen scenarios were rerun after the signal and startup-window fixes one ClickHouse operator deletion scenario after its documented PVC retention was taken into account, and `reloadable-setting-change` once the reloadable value went through each operator's no-restart setting; those results replace the first run's. Regenerate with `python3 -m chaosmonkey report <run dirs...> --readme-table`.
 
 | Operator | Correctness | PASS | DEGRADED | FAIL | SKIPPED | INVALID |
 |---|---|---|---|---|---|---|
 | altinity 0.27.4 | **81/100** | 69 | 4 | 15 | 0 | 0 |
-| clickhouse 0.0.8 | **92/100** | 72 | 10 | 3 | 3 | 0 |
+| clickhouse 0.0.8 | **92/100** | 73 | 9 | 3 | 3 | 0 |
 
 | Operator | Events | Runs timed | Mean s | p50 s | p90 s | p99 s | Max s | Never healthy | Client outage mean s | Outage p90 s | Outage max s |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | altinity 0.27.4 | failures | 52 | 53 | 17 | 116 | 302 | 302 | 10 | 17 | 27 | 265 |
-| altinity 0.27.4 | changes | 24 | 156 | 121 | 318 | 364 | 364 | 2 | 1 | 2 | 16 |
+| altinity 0.27.4 | changes | 24 | 155 | 121 | 318 | 364 | 364 | 2 | 1 | 2 | 16 |
 | clickhouse 0.0.8 | failures | 57 | 23 | 16 | 49 | 169 | 169 | 5 | 12 | 12 | 523 |
-| clickhouse 0.0.8 | changes | 23 | 114 | 33 | 203 | 789 | 789 | 0 | 1 | 2 | 10 |
+| clickhouse 0.0.8 | changes | 23 | 117 | 33 | 225 | 789 | 789 | 0 | 1 | 2 | 10 |
 
 | Category | altinity correctness / p50 / p90 s | clickhouse correctness / p50 / p90 s |
 |---|---|---|
@@ -171,7 +171,7 @@ Altinity operator 0.27.4 and ClickHouse operator 0.0.8, ClickHouse and Keeper 26
 | operator | 95 / 92 / 259 | 95 / 16 / 169 |
 | performance | 100 / 123 / 364 | 100 / 17 / 328 |
 | pods | 100 / 18 / 101 | 100 / 19 / 101 |
-| spec | 87 / 121 / 279 | 90 / 33 / 177 |
+| spec | 87 / 121 / 279 | 92 / 33 / 203 |
 | storage | 50 / 17 / 17 | 100 / 35 / 35 |
 
 **Correctness** asks whether the outcome was right: data kept, every host back, status honest, nothing destroyed. Per scenario it is 100 with no correctness finding, 50 with warnings only, 0 with a failure; a scenario run several times counts once with the average of its runs, and SKIPPED scenarios don't count. **Response time** is seconds from the fault ending (or the change being applied) until every pod is Ready and the change has reached every pod, one sample per run: `failures` are the scenarios that break something, `changes` the spec and performance ones. `Never healthy` counts runs with no time at all, which the percentiles leave out. Client outage is the longest run of failed reads or writes during the run. INVALID runs are not scored: the host was overloaded (load above 2 per CPU, or under 3 GB free), or the fault was never applied. PASS/DEGRADED/FAIL/SKIPPED/INVALID count runs.
@@ -223,7 +223,6 @@ Altinity operator 0.27.4 and ClickHouse operator 0.0.8, ClickHouse and Keeper 26
 | lifecycle | `new-replica-schema-blocked` | Add a replica while its traffic to Keeper is blocked, so creating replicated tables cannot succeed. The operator must not report the cluster healthy with that host in it. Then unblock and let it converge. Targets: healthy within 450 s, no row lost. | PASS (100)<br>correctness 100, healthy in 87 s | healthy 87 s after the fault ended, status agreed 50 s later; longest outage read 0 s / write 0 s; 0 of 298 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 7 s | healthy 7 s after the fault ended, status agreed 112 s later; longest outage read 0 s / write 0 s; 0 of 280 acknowledged batches lost |
 | spec | `keeper-scale-up` | Every new member must join the ensemble, quorum must hold throughout, and ClickHouse must keep writing. Targets: healthy within 420 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 46 s | healthy 46 s after the fault ended, status agreed 11 s later; longest outage read 0 s / write 0 s; 0 of 59 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 139 s | healthy 139 s after the fault ended, status agreed 65 s later; longest outage read 0 s / write 0 s; 0 of 183 acknowledged batches lost |
 | spec | `server-version-downgrade` | Rolling downgrade clickhouse/clickhouse-server:26.8 -> 26.3 with queries running. Targets: healthy within 480 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 330 s | healthy 330 s after the fault ended, status agreed 32 s later; longest outage read 0 s / write 0 s; 0 of 326 acknowledged batches lost | DEGRADED (50)<br>correctness 100, healthy in 177 s | clients saw an outage: read availability 78.8% below 95.0% over 151 samples; healthy 177 s after the fault ended, status agreed 7 s later; 0 of 153 acknowledged batches lost |
-| spec | `reloadable-setting-change` | Set max_concurrent_queries. The new value must reach every host; restarting hosts to apply it is reported. Targets: healthy within 300 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 93 s | healthy 93 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 96 acknowledged batches lost | DEGRADED (50)<br>correctness 50, healthy in 168 s | unneeded restart: restarted 4 of 4 hosts for a setting ClickHouse reloads live; healthy 168 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 163 acknowledged batches lost |
 | operator | `operator-kill-mid-scale-up` | The new operator pod must finish the scale-up, including the schema on the new replica. Targets: healthy within 420 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 92 s | healthy 92 s after the fault ended, status agreed 51 s later; longest outage read 0 s / write 0 s; 0 of 138 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 16 s | healthy 16 s after the fault ended, status agreed 182 s later; longest outage read 0 s / write 0 s; 0 of 188 acknowledged batches lost |
 | operator | `operator-reinstall` | Remove the operator Deployment and install it again. A healthy cluster must not be restarted or reconfigured by the fresh install. Targets: healthy within 60 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 0 s | healthy 0 s after the fault ended, status agreed 6 s later; longest outage read 0 s / write 0 s; 0 of 127 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 0 s | healthy 0 s after the fault ended, status agreed 6 s later; longest outage read 0 s / write 0 s; 0 of 115 acknowledged batches lost |
 | operator | `operator-down-service-deleted` | Scale the operator to zero, delete the client Service, bring the operator back. The returning operator must recreate it. Targets: healthy within 120 s, no row lost. | PASS (100)<br>correctness 100, healthy in 28 s | healthy 28 s after the fault ended, status agreed 45 s later; longest outage read 48 s / write 48 s; 0 of 84 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 0 s | healthy 0 s after the fault ended, status agreed 6 s later; longest outage read 28 s / write 28 s; 0 of 25 acknowledged batches lost |
@@ -266,6 +265,7 @@ Altinity operator 0.27.4 and ClickHouse operator 0.0.8, ClickHouse and Keeper 26
 | storage | `keeper-member-volume-lost` | Delete a follower's PVC and pod. It comes back with an empty log and must rejoin the ensemble from a snapshot, with quorum held throughout. Targets: healthy within 180 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 17 s | healthy 17 s after the fault ended, status agreed 6 s later; longest outage read 0 s / write 0 s; 0 of 33 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 16 s | healthy 16 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 31 acknowledged batches lost |
 | network | `replica-pair-partition` | Each replica of shard 0 refuses connections from the other. Both keep taking writes; once the partition lifts they must end up with identical data. Targets: healthy within 120 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 0 s | healthy 0 s after the fault ended, status agreed 6 s later; longest outage read 0 s / write 0 s; 0 of 96 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 0 s | healthy 0 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 94 acknowledged batches lost |
 | pods | `server-and-keeper-kill` | Quorum holds and the other replica serves; both pods must come back. Targets: healthy within 120 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 17 s | healthy 17 s after the fault ended, status agreed 6 s later; longest outage read 0 s / write 1 s; 0 of 28 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 16 s | healthy 16 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 32 acknowledged batches lost |
+| spec | `reloadable-setting-change` | Set max_concurrent_queries through the operator's setting for values that need no restart. The new value must reach every host; restarting hosts to apply it is reported. Targets: healthy within 300 s, read outage up to 10 s, write outage up to 20 s, no row lost. | PASS (100)<br>correctness 100, healthy in 82 s | healthy 82 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 89 acknowledged batches lost | PASS (100)<br>correctness 100, healthy in 225 s | healthy 225 s after the fault ended, status agreed 7 s later; longest outage read 0 s / write 0 s; 0 of 216 acknowledged batches lost |
 
 ### Causes behind each finding
 
@@ -330,10 +330,6 @@ Operator defects:
   repaired.
 
 Documented behaviour or design choices, reported but not a defect:
-
-- ClickHouse operator, `reloadable-setting-change`: every host restarts for a change to
-  `max_concurrent_queries`, which ClickHouse marks `changeable_without_restart` and applies from
-  the config file without one.
 
 - ClickHouse operator, `scale-down-shard-then-up`: PVCs are never deleted, so a re-added shard
   comes back with the removed shard's rows. The docs say PVCs are kept and can be reused.

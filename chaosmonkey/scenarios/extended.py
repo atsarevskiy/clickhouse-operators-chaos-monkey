@@ -904,14 +904,19 @@ class ReloadableSettingChange(Scenario):
         super().__init__(
             id="reloadable-setting-change", category="spec", min_replicas=2,
             title="Change a server setting ClickHouse reloads live",
-            description="Set max_concurrent_queries. The new value must reach every host; restarting hosts to "
-                        "apply it is reported.",
+            description="Set max_concurrent_queries through the operator's setting for values that need no "
+                        "restart. The new value must reach every host; restarting hosts to apply it is reported.",
             expect=Expectations(recover_within_s=900, recover_slo_s=300))
         self.value = "321"
 
+    def spec_for(self, base):
+        # the field is present from the start, so the change is a value change only
+        return super().spec_for(base).copy(reloadable_settings={"max_concurrent_queries": "500"})
+
     def inject(self, ctx: Context) -> None:
         ctx.notes["before"] = _restarts(ctx)
-        ctx.reapply(ctx.spec.copy(server_settings={**ctx.spec.server_settings, "max_concurrent_queries": self.value}))
+        ctx.reapply(ctx.spec.copy(reloadable_settings={**ctx.spec.reloadable_settings,
+                                                       "max_concurrent_queries": self.value}))
         time.sleep(10)
 
     def done(self, ctx: Context) -> bool:
